@@ -147,7 +147,6 @@ class CryptoDataSource(BaseDataSource):
         - OKX: BTC/USDT (标准格式，但某些币种可能不支持)
         - Coinbase: BTC/USD (通常使用 USD 而不是 USDT)
         - Kraken: XBT/USD (BTC 映射为 XBT)
-        - Bitfinex: tBTCUST (特殊格式)
         """
         normalized, base = self._normalize_symbol(symbol)
         

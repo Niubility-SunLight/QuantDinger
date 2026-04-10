@@ -4,14 +4,17 @@ Binance Spot (direct REST) client.
 
 from __future__ import annotations
 
-import hmac
 import hashlib
+import hmac
+import logging
 import time
 from decimal import Decimal, ROUND_DOWN
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlencode
 
 from app.services.live_trading.base import BaseRestClient, LiveOrderResult, LiveTradingError
+
+logger = logging.getLogger(__name__)
 from app.services.live_trading.symbols import to_binance_futures_symbol
 
 
@@ -553,6 +556,20 @@ class BinanceSpotClient(BaseRestClient):
                 if (not fee_ccy) and ccy:
                     fee_ccy = ccy
         return float(total_fee), str(fee_ccy or "")
+
+    def get_fee_rate(self, symbol: str, market_type: str = "spot") -> Optional[Dict[str, float]]:
+        sym = symbol.upper().replace("-", "").replace("/", "")
+        try:
+            data = self._signed_request("GET", "/sapi/v1/asset/tradeFee", params={"symbol": sym})
+            if isinstance(data, list) and data and isinstance(data[0], dict):
+                rec = data[0]
+                maker = abs(float(rec.get("makerCommission") or 0))
+                taker = abs(float(rec.get("takerCommission") or 0))
+                if maker > 0 or taker > 0:
+                    return {"maker": maker, "taker": taker}
+        except Exception as e:
+            logger.warning(f"BinanceSpot get_fee_rate({symbol}) failed: {e}")
+        return None
 
     def cancel_order(self, *, symbol: str, order_id: str = "", client_order_id: str = "") -> Dict[str, Any]:
         sym = to_binance_futures_symbol(symbol)

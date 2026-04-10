@@ -2,14 +2,17 @@
 Factory for direct exchange clients.
 
 Supports:
-- Crypto exchanges: Binance, OKX, Bitget, Bybit, Coinbase, Kraken, KuCoin, Gate, Bitfinex, Deepcoin, HTX
+- Crypto exchanges: Binance, OKX, Bitget, Bybit, Coinbase, Kraken, KuCoin, Gate, Deepcoin, HTX
 - Traditional brokers: Interactive Brokers (IBKR) for US stocks
 - Forex brokers: MetaTrader 5 (MT5)
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, Union
+import logging
+from typing import Any, Dict, Optional, Union
+
+logger = logging.getLogger(__name__)
 
 from app.services.live_trading.base import BaseRestClient, LiveTradingError
 from app.services.live_trading.binance import BinanceFuturesClient
@@ -23,7 +26,6 @@ from app.services.live_trading.kraken import KrakenClient
 from app.services.live_trading.kraken_futures import KrakenFuturesClient
 from app.services.live_trading.kucoin import KucoinSpotClient, KucoinFuturesClient
 from app.services.live_trading.gate import GateSpotClient, GateUsdtFuturesClient
-from app.services.live_trading.bitfinex import BitfinexClient, BitfinexDerivativesClient
 from app.services.live_trading.deepcoin import DeepcoinClient
 from app.services.live_trading.htx import HtxClient
 
@@ -173,13 +175,6 @@ def create_client(exchange_config: Dict[str, Any], *, market_type: str = "swap")
         default_fut = "https://fx-api-testnet.gateio.ws" if is_demo else "https://fx-api.gateio.ws"
         base_url = _get(exchange_config, "base_url", "baseUrl") or default_fut
         return GateUsdtFuturesClient(api_key=api_key, secret_key=secret_key, base_url=base_url, channel_id=gate_channel_id)
-
-    if exchange_id == "bitfinex":
-        # Same REST host; use keys from Bitfinex paper/sub-account where applicable.
-        base_url = _get(exchange_config, "base_url", "baseUrl") or "https://api.bitfinex.com"
-        if mt == "spot":
-            return BitfinexClient(api_key=api_key, secret_key=secret_key, base_url=base_url)
-        return BitfinexDerivativesClient(api_key=api_key, secret_key=secret_key, base_url=base_url)
 
     if exchange_id == "deepcoin":
         if is_demo and not (_get(exchange_config, "base_url", "baseUrl")):
@@ -338,5 +333,22 @@ def create_mt5_client(exchange_config: Dict[str, Any]):
         )
 
     return client
+
+
+def query_fee_rate(
+    exchange_config: Dict[str, Any],
+    symbol: str,
+    market_type: str = "swap",
+) -> Optional[Dict[str, float]]:
+    """
+    Best-effort: create a temporary client and query the account's fee tier
+    for the given symbol.  Returns {"maker": 0.0002, "taker": 0.0005} or None.
+    """
+    try:
+        client = create_client(exchange_config, market_type=market_type)
+        return client.get_fee_rate(symbol, market_type=market_type)
+    except Exception as e:
+        logger.debug(f"query_fee_rate failed for {symbol}: {e}")
+        return None
 
 

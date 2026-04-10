@@ -120,6 +120,24 @@ class _GateBase(BaseRestClient):
             raise LiveTradingError(f"Gate HTTP {code}: {text[:500]}")
         return data
 
+    def get_fee_rate(self, symbol: str, market_type: str = "swap") -> Optional[Dict[str, float]]:
+        pair = to_gate_currency_pair(symbol)
+        try:
+            if market_type == "spot":
+                raw = self._signed_request("GET", "/api/v4/wallet/fee", params={"currency_pair": pair})
+            else:
+                settle = "usdt"
+                contract = pair.replace("_", "").upper() + "_USDT" if "_" not in pair.upper() or "USDT" not in pair.upper() else pair
+                raw = self._signed_request("GET", f"/api/v4/futures/{settle}/contracts/{contract}", params={})
+            if isinstance(raw, dict):
+                maker = abs(float(raw.get("maker_fee_rate") or raw.get("maker_fee") or 0))
+                taker = abs(float(raw.get("taker_fee_rate") or raw.get("taker_fee") or 0))
+                if maker > 0 or taker > 0:
+                    return {"maker": maker, "taker": taker}
+        except Exception as e:
+            logger.warning(f"Gate get_fee_rate({symbol}) failed: {e}")
+        return None
+
 
 class GateSpotClient(_GateBase):
     def ping(self) -> bool:
@@ -194,6 +212,7 @@ class GateSpotClient(_GateBase):
         end_ts = time.time() + float(max_wait_sec or 0.0)
         last: Dict[str, Any] = {}
         while True:
+            timed_out = time.time() >= end_ts
             try:
                 resp = self.get_order(order_id=str(order_id))
                 last = resp if isinstance(resp, dict) else {"raw": resp}
@@ -220,11 +239,18 @@ class GateSpotClient(_GateBase):
             except Exception:
                 fee = 0.0
             fee_ccy = str(last.get("fee_currency") or "").strip()
+            # Fee may lag behind filled/avg on order object; keep polling until timeout (same idea as Bitget/OKX).
             if filled > 0 and avg_price > 0:
+                if fee <= 0 and not timed_out:
+                    time.sleep(float(poll_interval_sec or 0.5))
+                    continue
                 return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "status": status, "order": last}
             if status.lower() in ("closed", "cancelled", "canceled"):
+                if fee <= 0 and filled > 0 and avg_price > 0 and not timed_out:
+                    time.sleep(float(poll_interval_sec or 0.5))
+                    continue
                 return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "status": status, "order": last}
-            if time.time() >= end_ts:
+            if timed_out:
                 return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "status": status, "order": last}
             time.sleep(float(poll_interval_sec or 0.5))
 
@@ -507,7 +533,7 @@ class GateUsdtFuturesClient(_GateBase):
             raise LiveTradingError("Gate futures get_order requires order_id")
         return self._signed_request("GET", f"/api/v4/futures/usdt/orders/{str(order_id)}")
 
-    def wait_for_fill(self, *, order_id: str, contract: str, max_wait_sec: float = 3.0, poll_interval_sec: float = 0.5) -> Dict[str, Any]:
+    def wait_for_fill(self, *, order_id: str, contract: str, max_wait_sec: float = 12.0, poll_interval_sec: float = 0.5) -> Dict[str, Any]:
         end_ts = time.time() + float(max_wait_sec or 0.0)
         last: Dict[str, Any] = {}
         qm = Decimal("1")
@@ -519,6 +545,7 @@ class GateUsdtFuturesClient(_GateBase):
         except Exception:
             qm = Decimal("1")
         while True:
+            timed_out = time.time() >= end_ts
             try:
                 resp = self.get_order(order_id=str(order_id))
                 last = resp if isinstance(resp, dict) else {"raw": resp}
@@ -548,10 +575,16 @@ class GateUsdtFuturesClient(_GateBase):
             if fee > 0:
                 fee_ccy = "USDT"
             if filled > 0 and avg_price > 0:
+                if fee <= 0 and not timed_out:
+                    time.sleep(float(poll_interval_sec or 0.5))
+                    continue
                 return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "status": status, "order": last}
             if str(status).lower() in ("finished", "cancelled", "canceled"):
+                if fee <= 0 and filled > 0 and avg_price > 0 and not timed_out:
+                    time.sleep(float(poll_interval_sec or 0.5))
+                    continue
                 return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "status": status, "order": last}
-            if time.time() >= end_ts:
+            if timed_out:
                 return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "status": status, "order": last}
             time.sleep(float(poll_interval_sec or 0.5))
 

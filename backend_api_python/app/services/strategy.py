@@ -69,7 +69,7 @@ class StrategyService:
 
             # For these exchanges, prefer direct REST (no ccxt), aligned with local live-trading design.
             ex = str(exchange_id or "").strip().lower()
-            if ex in ("bybit", "coinbaseexchange", "coinbase_exchange", "kraken", "kucoin", "gate", "bitfinex"):
+            if ex in ("bybit", "coinbaseexchange", "coinbase_exchange", "kraken", "kucoin", "gate"):
                 import requests
 
                 def _req_json(url: str) -> Any:
@@ -205,29 +205,6 @@ class StrategyService:
                     symbols = sorted(list(set(symbols)))
                     return {'success': True, 'message': f'Success, {len(symbols)} trading pairs', 'symbols': symbols}
 
-                if ex == "bitfinex":
-                    j = _req_json("https://api-pub.bitfinex.com/v2/conf/pub:list:pair:exchange") if market_type == "spot" else _req_json(
-                        "https://api-pub.bitfinex.com/v2/conf/pub:list:pair:futures"
-                    )
-                    pairs = []
-                    if isinstance(j, list) and j and isinstance(j[0], list):
-                        pairs = j[0]
-                    for p in pairs:
-                        s = str(p or "").upper()
-                        if not s:
-                            continue
-                        if market_type != "spot":
-                            symbols.append(s)
-                            continue
-                        # Focus USDT (Bitfinex uses UST)
-                        if s.endswith("UST") and len(s) > 3:
-                            symbols.append(f"{s[:-3]}/USDT")
-                        elif s.endswith("USDT") and len(s) > 4:
-                            symbols.append(f"{s[:-4]}/USDT")
-                    symbols = sorted(list(set(symbols)))
-                    return {'success': True, 'message': f'Success, {len(symbols)} trading pairs', 'symbols': symbols}
-                return {'success': True, 'message': 'Success', 'symbols': symbols}
-            
             import ccxt
             
             # Create exchange instance (public only)
@@ -282,7 +259,6 @@ class StrategyService:
                 from app.services.live_trading.kucoin import KucoinSpotClient
                 from app.services.live_trading.kucoin import KucoinFuturesClient
                 from app.services.live_trading.gate import GateSpotClient, GateUsdtFuturesClient
-                from app.services.live_trading.bitfinex import BitfinexClient, BitfinexDerivativesClient
                 from app.services.live_trading.deepcoin import DeepcoinClient
                 from app.services.live_trading.htx import HtxClient
 
@@ -407,10 +383,6 @@ class StrategyService:
                         return client.get_accounts()
                     if isinstance(client, GateUsdtFuturesClient):
                         return client.get_accounts()
-                    if isinstance(client, BitfinexClient):
-                        return client.get_wallets()
-                    if isinstance(client, BitfinexDerivativesClient):
-                        return client.get_wallets()
                     if isinstance(client, DeepcoinClient):
                         return client.get_balance()
                     if isinstance(client, HtxClient):

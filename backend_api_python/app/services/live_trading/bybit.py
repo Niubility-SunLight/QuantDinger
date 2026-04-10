@@ -12,12 +12,15 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
 import time
 from decimal import Decimal, ROUND_DOWN
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlencode
 
 from app.services.live_trading.base import BaseRestClient, LiveOrderResult, LiveTradingError
+
+logger = logging.getLogger(__name__)
 from app.services.live_trading.symbols import to_bybit_symbol
 
 
@@ -626,6 +629,7 @@ class BybitClient(BaseRestClient):
         end_ts = time.time() + float(max_wait_sec or 0.0)
         last: Dict[str, Any] = {}
         while True:
+            timed_out = time.time() >= end_ts
             try:
                 last = self.get_order(symbol=symbol, order_id=str(order_id or ""), client_order_id=str(client_order_id or ""))
             except Exception:
@@ -665,11 +669,18 @@ class BybitClient(BaseRestClient):
                     fee = 0.0
                 if fee > 0 and self.category == "linear":
                     fee_ccy = "USDT"
+            # cumExecFee / cumFeeDetail can lag slightly after fill shows up.
             if filled > 0 and avg_price > 0:
+                if fee <= 0 and not timed_out:
+                    time.sleep(float(poll_interval_sec or 0.5))
+                    continue
                 return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "status": status, "order": last}
             if status.lower() in ("filled", "cancelled", "canceled", "rejected"):
+                if fee <= 0 and filled > 0 and avg_price > 0 and not timed_out:
+                    time.sleep(float(poll_interval_sec or 0.5))
+                    continue
                 return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "status": status, "order": last}
-            if time.time() >= end_ts:
+            if timed_out:
                 return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "status": status, "order": last}
             time.sleep(float(poll_interval_sec or 0.5))
 
@@ -695,6 +706,23 @@ class BybitClient(BaseRestClient):
             sc = (settle_coin or "USDT").strip().upper() or "USDT"
             params["settleCoin"] = sc
         return self._signed_request("GET", "/v5/position/list", params=params)
+
+    def get_fee_rate(self, symbol: str, market_type: str = "swap") -> Optional[Dict[str, float]]:
+        cat = "spot" if market_type == "spot" else "linear"
+        sym = to_bybit_symbol(symbol)
+        try:
+            raw = self._signed_request("GET", "/v5/account/fee-rate", params={"category": cat, "symbol": sym})
+            result = raw.get("result") or {}
+            items = result.get("list") or []
+            if items and isinstance(items[0], dict):
+                rec = items[0]
+                maker = abs(float(rec.get("makerFeeRate") or 0))
+                taker = abs(float(rec.get("takerFeeRate") or 0))
+                if maker > 0 or taker > 0:
+                    return {"maker": maker, "taker": taker}
+        except Exception as e:
+            logger.warning(f"Bybit get_fee_rate({symbol}) failed: {e}")
+        return None
 
     def set_leverage(self, *, symbol: str, leverage: float) -> bool:
         if self.category != "linear":

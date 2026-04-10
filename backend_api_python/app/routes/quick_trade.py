@@ -867,7 +867,7 @@ def _fetch_exchange_positions_raw(
     """
     Fetch raw position payload for quick-trade / close-position.
 
-    Many clients do not accept ``symbol=`` on ``get_positions()`` (Gate, KuCoin, Bitfinex),
+    Many clients do not accept ``symbol=`` on ``get_positions()`` (Gate, KuCoin),
     or need extra args (Bitget ``product_type``, OKX ``inst_type``). Centralize here.
     """
     from app.services.live_trading.binance import BinanceFuturesClient

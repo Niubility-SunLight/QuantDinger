@@ -45,6 +45,9 @@ def _format_datetime(dt: Any) -> Any:
     if dt is None:
         return None
     if hasattr(dt, 'isoformat'):
+        from datetime import timezone as _tz
+        if hasattr(dt, 'tzinfo') and getattr(dt, 'tzinfo', None) is None:
+            dt = dt.replace(tzinfo=_tz.utc)
         return dt.isoformat()
     return dt
 
@@ -403,11 +406,15 @@ def summary():
             cur.close()
         
         # Convert datetime to timestamp for frontend compatibility
+        from datetime import timezone as _tz
         recent_trades = []
         for t in recent_trades_raw:
             trade = dict(t)
-            if trade.get('created_at') and hasattr(trade['created_at'], 'timestamp'):
-                trade['created_at'] = int(trade['created_at'].timestamp())
+            ca = trade.get('created_at')
+            if ca and hasattr(ca, 'timestamp'):
+                if getattr(ca, 'tzinfo', None) is None:
+                    ca = ca.replace(tzinfo=_tz.utc)
+                trade['created_at'] = int(ca.timestamp())
             recent_trades.append(trade)
 
         # Total equity/pnl (best-effort) - calculate before performance stats for drawdown calculation

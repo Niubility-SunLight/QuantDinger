@@ -402,7 +402,7 @@ class BitgetSpotClient(BaseRestClient):
         symbol: str,
         order_id: str,
         client_order_id: str = "",
-        max_wait_sec: float = 10.0,
+        max_wait_sec: float = 12.0,
         poll_interval_sec: float = 0.5,
     ) -> Dict[str, Any]:
         end_ts = time.time() + float(max_wait_sec or 0.0)
@@ -410,8 +410,17 @@ class BitgetSpotClient(BaseRestClient):
         last_fills: Dict[str, Any] = {}
         state = ""
 
+        def _spot_order_row(raw: Dict[str, Any]) -> Dict[str, Any]:
+            od = raw.get("data") if isinstance(raw, dict) else None
+            if isinstance(od, dict):
+                return od
+            if isinstance(od, list) and od and isinstance(od[0], dict):
+                return od[0]
+            return {}
+
         while True:
-            # Prefer fills to compute weighted average if available.
+            timed_out = time.time() >= end_ts
+            # Prefer fills to compute weighted average + fee (may lag vs orderInfo).
             try:
                 last_fills = self.get_fills(symbol=symbol, order_id=str(order_id))
                 data = last_fills.get("data") if isinstance(last_fills, dict) else None
@@ -428,7 +437,6 @@ class BitgetSpotClient(BaseRestClient):
                             if sz > 0 and px > 0:
                                 total_base += sz
                                 total_quote += sz * px
-                            # Best-effort fee extraction (fields vary by endpoint/version).
                             fee_v = f.get("fee")
                             if fee_v is None:
                                 fee_v = f.get("fillFee")
@@ -446,6 +454,9 @@ class BitgetSpotClient(BaseRestClient):
                         except Exception:
                             continue
                 if total_base > 0 and total_quote > 0:
+                    if total_fee <= 0 and not timed_out:
+                        time.sleep(float(poll_interval_sec or 0.5))
+                        continue
                     return {
                         "filled": total_base,
                         "avg_price": total_quote / total_base,
@@ -453,21 +464,51 @@ class BitgetSpotClient(BaseRestClient):
                         "fee_ccy": str(fee_ccy or ""),
                         "state": state,
                         "order": last_order,
-                        "fills": last_fills
+                        "fills": last_fills,
                     }
             except Exception:
                 pass
 
             try:
                 last_order = self.get_order(symbol=symbol, order_id=str(order_id or ""), client_order_id=str(client_order_id or ""))
-                od = last_order.get("data") if isinstance(last_order, dict) else None
-                if isinstance(od, dict):
-                    state = str(od.get("status") or od.get("state") or "")
+                row = _spot_order_row(last_order)
+                if row:
+                    state = str(row.get("status") or row.get("state") or "")
             except Exception:
                 pass
 
-            if time.time() >= end_ts:
-                return {"filled": 0.0, "avg_price": 0.0, "state": state, "order": last_order, "fills": last_fills}
+            if timed_out:
+                row = _spot_order_row(last_order)
+                filled = 0.0
+                avg_price = 0.0
+                fee = 0.0
+                fee_ccy = ""
+                try:
+                    filled = float(row.get("baseVolume") or row.get("filledQty") or row.get("dealSize") or row.get("size") or 0.0)
+                except Exception:
+                    filled = 0.0
+                try:
+                    quote_amt = float(row.get("quoteVolume") or row.get("filledTotalAmount") or row.get("dealFunds") or 0.0)
+                    if filled > 0 and quote_amt > 0:
+                        avg_price = quote_amt / filled
+                    else:
+                        avg_price = float(row.get("priceAvg") or row.get("price") or 0.0)
+                except Exception:
+                    avg_price = 0.0
+                try:
+                    fee = abs(float(row.get("fee") or row.get("fillFee") or 0.0))
+                    fee_ccy = str(row.get("feeCoin") or row.get("feeCcy") or "").strip()
+                except Exception:
+                    pass
+                return {
+                    "filled": filled,
+                    "avg_price": avg_price,
+                    "fee": fee,
+                    "fee_ccy": fee_ccy,
+                    "state": state,
+                    "order": last_order,
+                    "fills": last_fills,
+                }
             time.sleep(float(poll_interval_sec or 0.5))
 
     def get_assets(self) -> Dict[str, Any]:

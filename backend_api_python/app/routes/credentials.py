@@ -72,7 +72,7 @@ def list_credentials():
 
 CRYPTO_EXCHANGES = [
     'binance', 'okx', 'bitget', 'bybit', 'coinbaseexchange',
-    'kraken', 'kucoin', 'gate', 'bitfinex', 'deepcoin', 'htx'
+    'kraken', 'kucoin', 'gate', 'deepcoin', 'htx'
 ]
 
 

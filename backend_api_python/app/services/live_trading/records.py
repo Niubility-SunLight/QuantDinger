@@ -9,9 +9,64 @@ Important:
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.utils.db import get_db_connection
+
+
+def normalize_strategy_symbol(symbol: str) -> str:
+    """
+    Canonical symbol for qd_strategy_positions / qd_strategy_trades (e.g. BTC/USDT).
+
+    Mixed formats (BTCUSDT vs BTC/USDT) previously broke position lookup, so closes
+    had no local entry_price and profit stayed NULL.
+    """
+    s = str(symbol or "").strip().upper().replace("-", "")
+    if not s:
+        return ""
+    if "/" in s:
+        return s
+    for quote in ("USDT", "USDC", "USD", "BUSD", "EUR"):
+        if s.endswith(quote) and len(s) > len(quote):
+            return f"{s[: -len(quote)]}/{quote}"
+    return s
+
+
+def _position_symbol_candidates(symbol: str) -> List[str]:
+    """Unique symbol strings to try when resolving a position row."""
+    raw = str(symbol or "").strip()
+    if not raw:
+        return []
+    norm = normalize_strategy_symbol(raw)
+    compact = norm.replace("/", "")
+    raw_compact = raw.upper().replace("/", "").replace("-", "")
+    out: List[str] = []
+    for x in (raw, raw.upper(), norm, compact, raw_compact):
+        if x and x not in out:
+            out.append(x)
+    return out
+
+
+def _fetch_position_fuzzy(strategy_id: int, symbol: str, side: str) -> Tuple[Dict[str, Any], str]:
+    """
+    Find a non-empty position row; return (row, db_symbol_to_use).
+    If none, db_symbol_to_use is the canonical form for new rows.
+    """
+    side_l = str(side or "").strip().lower()
+    for sym in _position_symbol_candidates(symbol):
+        row = _fetch_position(strategy_id, sym, side_l)
+        if row and float(row.get("size") or 0.0) > 0:
+            db_sym = str(row.get("symbol") or sym).strip()
+            return row, db_sym or sym
+    canon = normalize_strategy_symbol(symbol) or str(symbol or "").strip()
+    return {}, canon
+
+
+def _resolve_write_symbol(current: Dict[str, Any], cur_size: float, input_symbol: str) -> str:
+    """Use existing DB symbol when updating a row; otherwise canonical new key."""
+    if cur_size > 0 and current and str(current.get("symbol") or "").strip():
+        return str(current.get("symbol") or "").strip()
+    return normalize_strategy_symbol(input_symbol) or str(input_symbol or "").strip()
 
 
 def _get_user_id_from_strategy(strategy_id: int) -> int:
@@ -42,6 +97,7 @@ def record_trade(
     value = float(amount or 0.0) * float(price or 0.0)
     if user_id is None:
         user_id = _get_user_id_from_strategy(strategy_id)
+    sym_out = normalize_strategy_symbol(symbol) or str(symbol or "").strip()
     with get_db_connection() as db:
         cur = db.cursor()
         cur.execute(
@@ -54,7 +110,7 @@ def record_trade(
             (
                 int(user_id),
                 int(strategy_id),
-                str(symbol),
+                sym_out,
                 str(trade_type),
                 float(price or 0.0),
                 float(amount or 0.0),
@@ -157,11 +213,13 @@ def apply_fill_to_local_position(
     is_open = sig.startswith("open_") or sig.startswith("add_")
     is_close = sig.startswith("close_") or sig.startswith("reduce_")
 
-    current = _fetch_position(strategy_id, symbol, side)
+    sid = int(strategy_id)
+    current, _matched = _fetch_position_fuzzy(sid, symbol, side)
     cur_size = float(current.get("size") or 0.0)
     cur_entry = float(current.get("entry_price") or 0.0)
     cur_high = float(current.get("highest_price") or 0.0)
     cur_low = float(current.get("lowest_price") or 0.0)
+    sym_key = _resolve_write_symbol(current, cur_size, symbol)
 
     profit: Optional[float] = None
 
@@ -177,8 +235,8 @@ def apply_fill_to_local_position(
         new_high = max(cur_high or px, px)
         new_low = min(cur_low or px, px)
         upsert_position(
-            strategy_id=strategy_id,
-            symbol=symbol,
+            strategy_id=sid,
+            symbol=sym_key,
             side=side,
             size=new_size,
             entry_price=new_entry,
@@ -186,7 +244,7 @@ def apply_fill_to_local_position(
             highest_price=new_high,
             lowest_price=new_low,
         )
-        return None, _fetch_position(strategy_id, symbol, side)
+        return None, _fetch_position(sid, sym_key, side)
 
     if is_close:
         # Calculate PnL using local entry price.
@@ -199,14 +257,14 @@ def apply_fill_to_local_position(
 
         new_size = cur_size - filled_qty
         if new_size <= 0:
-            _delete_position(strategy_id, symbol, side)
+            _delete_position(sid, sym_key, side)
             return profit, None
         # Keep entry price for remaining position.
         new_high = max(cur_high or px, px)
         new_low = min(cur_low or px, px)
         upsert_position(
-            strategy_id=strategy_id,
-            symbol=symbol,
+            strategy_id=sid,
+            symbol=sym_key,
             side=side,
             size=new_size,
             entry_price=cur_entry if cur_entry > 0 else px,
@@ -214,7 +272,7 @@ def apply_fill_to_local_position(
             highest_price=new_high,
             lowest_price=new_low,
         )
-        return profit, _fetch_position(strategy_id, symbol, side)
+        return profit, _fetch_position(sid, sym_key, side)
 
     return None, None
 

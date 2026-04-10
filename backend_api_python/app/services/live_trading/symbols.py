@@ -74,11 +74,6 @@ _KRAKEN_BASE_MAP: Dict[str, str] = {
     "BTC": "XBT",
 }
 
-_BITFINEX_QUOTE_MAP: Dict[str, str] = {
-    # Bitfinex uses "UST" for Tether USDt
-    "USDT": "UST",
-}
-
 _KUCOIN_FUTURES_BASE_MAP: Dict[str, str] = {
     # KuCoin futures uses XBT for BTC on many contracts
     "BTC": "XBT",
@@ -175,30 +170,6 @@ def to_gate_currency_pair(symbol: str) -> str:
     if not base or not quote:
         return symbol
     return f"{base}_{quote}"
-
-
-def to_bitfinex_spot_symbol(symbol: str) -> str:
-    """
-    Bitfinex spot trading symbol format: tBASEQUOTE, e.g. tBTCUST.
-    """
-    base, quote = _split_base_quote(symbol)
-    if not base or not quote:
-        s = str(symbol or "").strip()
-        return s if s.startswith("t") else f"t{s}"
-    q = _BITFINEX_QUOTE_MAP.get(quote, quote)
-    return f"t{base}{q}"
-
-
-def to_bitfinex_perp_symbol(symbol: str) -> str:
-    """
-    Bitfinex derivatives perpetual naming (best-effort): tBASEF0:QUOTEF0, e.g. tBTCF0:USTF0.
-    """
-    base, quote = _split_base_quote(symbol)
-    if not base or not quote:
-        s = str(symbol or "").strip()
-        return s if s.startswith("t") else f"t{s}"
-    q = _BITFINEX_QUOTE_MAP.get(quote, quote)
-    return f"t{base}F0:{q}F0"
 
 
 def to_deepcoin_symbol(symbol: str) -> str:

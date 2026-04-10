@@ -150,4 +150,8 @@ class BaseRestClient:
     def _json_dumps(obj: Any) -> str:
         return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
 
+    def get_fee_rate(self, symbol: str, market_type: str = "swap") -> Optional[Dict[str, float]]:
+        """Query account fee rate from exchange. Returns {"maker": 0.0002, "taker": 0.0005} or None."""
+        return None
+
 

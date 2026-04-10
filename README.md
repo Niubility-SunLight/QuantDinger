@@ -426,7 +426,6 @@ The same links are available in the web app under **Profile → Open account** (
 | Kraken | Spot, Futures |
 | KuCoin | Spot, Futures |
 | Gate.io | Spot, Futures |
-| Bitfinex | Spot, Derivatives |
 
 ### Traditional Brokers & Markets
 

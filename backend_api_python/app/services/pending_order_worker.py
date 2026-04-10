@@ -32,8 +32,6 @@ from app.services.live_trading.kraken_futures import KrakenFuturesClient
 from app.services.live_trading.kucoin import KucoinSpotClient
 from app.services.live_trading.kucoin import KucoinFuturesClient
 from app.services.live_trading.gate import GateSpotClient, GateUsdtFuturesClient
-from app.services.live_trading.bitfinex import BitfinexClient
-from app.services.live_trading.bitfinex import BitfinexDerivativesClient
 from app.services.live_trading.deepcoin import DeepcoinClient
 from app.services.live_trading.htx import HtxClient
 from app.services.live_trading.symbols import to_okx_swap_inst_id
@@ -352,12 +350,17 @@ class PendingOrderWorker:
                                 total = 0.0
                             if not sym or abs(total) <= 0:
                                 continue
-                            # Symbol is like BTCUSDT -> BTC/USDT best-effort
                             hb_sym = sym.upper()
                             if hb_sym.endswith("USDT") and len(hb_sym) > 4 and "/" not in hb_sym:
                                 hb_sym = f"{hb_sym[:-4]}/USDT"
                             side = "long" if hold_side == "long" else "short"
                             exch_size.setdefault(hb_sym, {"long": 0.0, "short": 0.0})[side] = abs(float(total))
+                            try:
+                                ep = float(p.get("openPriceAvg") or p.get("averageOpenPrice") or 0.0)
+                                if ep > 0:
+                                    exch_entry_price.setdefault(hb_sym, {"long": 0.0, "short": 0.0})[side] = ep
+                            except Exception:
+                                pass
 
                 elif isinstance(client, BybitClient) and market_type == "swap":
                     # Bybit v5 requires symbol or settleCoin — use USDT for full linear book
@@ -380,6 +383,12 @@ class PendingOrderWorker:
                                 hb_sym = f"{hb_sym[:-4]}/USDT"
                             side = "long" if side0 == "buy" else ("short" if side0 == "sell" else ("long" if sz > 0 else "short"))
                             exch_size.setdefault(hb_sym, {"long": 0.0, "short": 0.0})[side] = abs(float(sz))
+                            try:
+                                ep = float(p.get("avgPrice") or p.get("entryPrice") or 0.0)
+                                if ep > 0:
+                                    exch_entry_price.setdefault(hb_sym, {"long": 0.0, "short": 0.0})[side] = ep
+                            except Exception:
+                                pass
 
                 elif isinstance(client, GateUsdtFuturesClient) and market_type == "swap":
                     resp = client.get_positions()
@@ -407,6 +416,12 @@ class PendingOrderWorker:
                             except Exception:
                                 pass
                             exch_size.setdefault(hb_sym, {"long": 0.0, "short": 0.0})[side] = float(qty_base)
+                            try:
+                                ep = float(p.get("entry_price") or p.get("open_price") or 0.0)
+                                if ep > 0:
+                                    exch_entry_price.setdefault(hb_sym, {"long": 0.0, "short": 0.0})[side] = ep
+                            except Exception:
+                                pass
 
                 elif isinstance(client, KucoinFuturesClient) and market_type == "swap":
                     resp = client.get_positions()
@@ -433,6 +448,12 @@ class PendingOrderWorker:
                             except Exception:
                                 pass
                             exch_size.setdefault(sym, {"long": 0.0, "short": 0.0})[side] = float(qty_base)
+                            try:
+                                ep = float(p.get("avgEntryPrice") or p.get("realLeverage") and float(p.get("posCost") or 0) / max(abs(qty_ct), 1e-12) or 0.0)
+                                if ep > 0:
+                                    exch_entry_price.setdefault(sym, {"long": 0.0, "short": 0.0})[side] = ep
+                            except Exception:
+                                pass
 
                 elif isinstance(client, KrakenFuturesClient) and market_type == "swap":
                     resp = client.get_open_positions()
@@ -450,24 +471,12 @@ class PendingOrderWorker:
                                 continue
                             side = "long" if sz > 0 else "short"
                             exch_size.setdefault(sym, {"long": 0.0, "short": 0.0})[side] = abs(float(sz))
-
-                elif isinstance(client, BitfinexDerivativesClient) and market_type == "swap":
-                    resp = client.get_positions()
-                    items = resp if isinstance(resp, list) else []
-                    if isinstance(items, list):
-                        for p in items:
-                            # Bitfinex positions are arrays; best-effort parse:
-                            # [symbol, status, amount, base_price, ...]
                             try:
-                                if isinstance(p, list) and len(p) >= 3:
-                                    sym = str(p[0] or "")
-                                    amt = float(p[2] or 0.0)
-                                    if not sym or abs(amt) <= 0:
-                                        continue
-                                    side = "long" if amt > 0 else "short"
-                                    exch_size.setdefault(sym, {"long": 0.0, "short": 0.0})[side] = abs(float(amt))
+                                ep = float(p.get("price") or p.get("avgPrice") or 0.0)
+                                if ep > 0:
+                                    exch_entry_price.setdefault(sym, {"long": 0.0, "short": 0.0})[side] = ep
                             except Exception:
-                                continue
+                                pass
 
                 elif MT5Client is not None and isinstance(client, MT5Client):
                     # MT5 forex positions
@@ -932,7 +941,7 @@ class PendingOrderWorker:
                 return
 
         # Validate crypto exchanges only for Crypto market
-        crypto_exchanges = ["binance", "okx", "bitget", "bybit", "coinbaseexchange", "kraken", "kucoin", "gate", "bitfinex"]
+        crypto_exchanges = ["binance", "okx", "bitget", "bybit", "coinbaseexchange", "kraken", "kucoin", "gate"]
         if exchange_id in crypto_exchanges:
             if market_category != "Crypto":
                 self._mark_failed(order_id=order_id, error=f"crypto_exchange_only_supports_crypto_got_{market_category.lower()}")
@@ -1047,15 +1056,16 @@ class PendingOrderWorker:
         ref_price = float(payload.get("ref_price") or payload.get("price") or order_row.get("price") or 0.0)
 
         # Helper: map signal -> side/posSide/reduceOnly
+        # Include stop/tp/trailing exit labels (same exchange side as plain close_*).
         def _signal_to_side_pos_reduce(sig_type: str):
             st = (sig_type or "").strip().lower()
             if st in ("open_long", "add_long"):
                 return "buy", "long", False
             if st in ("open_short", "add_short"):
                 return "sell", "short", False
-            if st in ("close_long", "reduce_long"):
+            if st in ("close_long", "reduce_long", "close_long_stop", "close_long_profit", "close_long_trailing"):
                 return "sell", "long", True
-            if st in ("close_short", "reduce_short"):
+            if st in ("close_short", "reduce_short", "close_short_stop", "close_short_profit", "close_short_trailing"):
                 return "buy", "short", True
             raise LiveTradingError(f"Unsupported signal_type: {sig_type}")
 
@@ -1162,7 +1172,7 @@ class PendingOrderWorker:
         def _apply_fee(fee: float, ccy: str = "") -> None:
             nonlocal total_fee, fee_ccy
             try:
-                fv = float(fee or 0.0)
+                fv = abs(float(fee or 0.0))
             except Exception:
                 fv = 0.0
             if fv > 0:
@@ -1465,22 +1475,6 @@ class PendingOrderWorker:
                         reduce_only=reduce_only,
                         client_order_id=limit_client_oid,
                     )
-                elif isinstance(client, BitfinexClient):
-                    res1 = client.place_limit_order(
-                        symbol=str(symbol),
-                        side=side,
-                        size=remaining,
-                        price=limit_price,
-                        client_order_id=limit_client_oid,
-                    )
-                elif isinstance(client, BitfinexDerivativesClient):
-                    res1 = client.place_limit_order(
-                        symbol=str(symbol),
-                        side=side,
-                        size=remaining,
-                        price=limit_price,
-                        client_order_id=limit_client_oid,
-                    )
                 elif isinstance(client, DeepcoinClient):
                     res1 = client.place_limit_order(
                         symbol=str(symbol),
@@ -1532,12 +1526,15 @@ class PendingOrderWorker:
                     _apply_fee(float(q.get("fee") or 0.0), str(q.get("fee_ccy") or ""))
                 elif isinstance(client, BitgetMixClient):
                     product_type = str(exchange_config.get("product_type") or exchange_config.get("productType") or "USDT-FUTURES")
-                    q = client.wait_for_fill(symbol=str(symbol), product_type=product_type, order_id=limit_order_id, client_oid=limit_client_oid, max_wait_sec=maker_wait_sec)
+                    # Bitget /mix/order/fills may lag behind order detail; use at least a few seconds for fee capture.
+                    bg_limit_wait = max(float(maker_wait_sec or 0.0), 8.0)
+                    q = client.wait_for_fill(symbol=str(symbol), product_type=product_type, order_id=limit_order_id, client_oid=limit_client_oid, max_wait_sec=bg_limit_wait)
                     phases["limit_query"] = q
                     _apply_fill(float(q.get("filled") or 0.0), float(q.get("avg_price") or 0.0))
                     _apply_fee(float(q.get("fee") or 0.0), str(q.get("fee_ccy") or ""))
                 elif isinstance(client, BitgetSpotClient):
-                    q = client.wait_for_fill(symbol=str(symbol), order_id=limit_order_id, client_order_id=limit_client_oid, max_wait_sec=maker_wait_sec)
+                    bg_spot_limit_wait = max(float(maker_wait_sec or 0.0), 8.0)
+                    q = client.wait_for_fill(symbol=str(symbol), order_id=limit_order_id, client_order_id=limit_client_oid, max_wait_sec=bg_spot_limit_wait)
                     phases["limit_query"] = q
                     _apply_fill(float(q.get("filled") or 0.0), float(q.get("avg_price") or 0.0))
                     _apply_fee(float(q.get("fee") or 0.0), str(q.get("fee_ccy") or ""))
@@ -1572,22 +1569,14 @@ class PendingOrderWorker:
                     _apply_fill(float(q.get("filled") or 0.0), float(q.get("avg_price") or 0.0))
                     _apply_fee(float(q.get("fee") or 0.0), str(q.get("fee_ccy") or ""))
                 elif isinstance(client, GateSpotClient):
-                    q = client.wait_for_fill(order_id=limit_order_id, max_wait_sec=maker_wait_sec)
+                    gate_spot_limit_wait = max(float(maker_wait_sec or 0.0), 8.0)
+                    q = client.wait_for_fill(order_id=limit_order_id, max_wait_sec=gate_spot_limit_wait)
                     phases["limit_query"] = q
                     _apply_fill(float(q.get("filled") or 0.0), float(q.get("avg_price") or 0.0))
                     _apply_fee(float(q.get("fee") or 0.0), str(q.get("fee_ccy") or ""))
                 elif isinstance(client, GateUsdtFuturesClient):
-                    q = client.wait_for_fill(order_id=limit_order_id, contract=to_gate_currency_pair(str(symbol)), max_wait_sec=maker_wait_sec)
-                    phases["limit_query"] = q
-                    _apply_fill(float(q.get("filled") or 0.0), float(q.get("avg_price") or 0.0))
-                    _apply_fee(float(q.get("fee") or 0.0), str(q.get("fee_ccy") or ""))
-                elif isinstance(client, BitfinexClient):
-                    q = client.wait_for_fill(order_id=limit_order_id, max_wait_sec=maker_wait_sec)
-                    phases["limit_query"] = q
-                    _apply_fill(float(q.get("filled") or 0.0), float(q.get("avg_price") or 0.0))
-                    _apply_fee(float(q.get("fee") or 0.0), str(q.get("fee_ccy") or ""))
-                elif isinstance(client, BitfinexDerivativesClient):
-                    q = client.wait_for_fill(order_id=limit_order_id, max_wait_sec=maker_wait_sec)
+                    gate_limit_wait = max(float(maker_wait_sec or 0.0), 8.0)
+                    q = client.wait_for_fill(order_id=limit_order_id, contract=to_gate_currency_pair(str(symbol)), max_wait_sec=gate_limit_wait)
                     phases["limit_query"] = q
                     _apply_fill(float(q.get("filled") or 0.0), float(q.get("avg_price") or 0.0))
                     _apply_fee(float(q.get("fee") or 0.0), str(q.get("fee_ccy") or ""))
@@ -1659,10 +1648,6 @@ class PendingOrderWorker:
                             phases["limit_cancel"] = client.cancel_order(order_id=limit_order_id)
                         elif isinstance(client, GateUsdtFuturesClient):
                             phases["limit_cancel"] = client.cancel_order(order_id=limit_order_id)
-                        elif isinstance(client, BitfinexClient):
-                            phases["limit_cancel"] = client.cancel_order(order_id=limit_order_id, client_order_id=limit_client_oid)
-                        elif isinstance(client, BitfinexDerivativesClient):
-                            phases["limit_cancel"] = client.cancel_order(order_id=limit_order_id, client_order_id=limit_client_oid)
                         elif isinstance(client, DeepcoinClient):
                             phases["limit_cancel"] = client.cancel_order(symbol=str(symbol), order_id=limit_order_id, client_order_id=limit_client_oid)
                         elif isinstance(client, HtxClient):
@@ -1839,15 +1824,6 @@ class PendingOrderWorker:
                         reduce_only=reduce_only,
                         client_order_id=market_client_oid,
                     )
-                elif isinstance(client, BitfinexClient):
-                    res2 = client.place_market_order(
-                        symbol=str(symbol),
-                        side=side,
-                        size=remaining,
-                        client_order_id=market_client_oid,
-                    )
-                elif isinstance(client, BitfinexDerivativesClient):
-                    res2 = client.place_market_order(symbol=str(symbol), side=side, size=remaining, client_order_id=market_client_oid)
                 elif isinstance(client, DeepcoinClient):
                     if market_type == "swap":
                         try:
@@ -1903,72 +1879,62 @@ class PendingOrderWorker:
                     _apply_fee(float(q2.get("fee") or 0.0), str(q2.get("fee_ccy") or ""))
                 elif isinstance(client, BitgetMixClient):
                     product_type = str(exchange_config.get("product_type") or exchange_config.get("productType") or "USDT-FUTURES")
-                    q2 = client.wait_for_fill(symbol=str(symbol), product_type=product_type, order_id=market_order_id, client_oid=market_client_oid, max_wait_sec=3.0)
+                    q2 = client.wait_for_fill(symbol=str(symbol), product_type=product_type, order_id=market_order_id, client_oid=market_client_oid, max_wait_sec=12.0)
                     phases["market_query"] = q2
                     _apply_fill(float(q2.get("filled") or 0.0), float(q2.get("avg_price") or 0.0))
                     _apply_fee(float(q2.get("fee") or 0.0), str(q2.get("fee_ccy") or ""))
                 elif isinstance(client, BitgetSpotClient):
-                    q2 = client.wait_for_fill(symbol=str(symbol), order_id=market_order_id, client_order_id=market_client_oid, max_wait_sec=3.0)
+                    q2 = client.wait_for_fill(symbol=str(symbol), order_id=market_order_id, client_order_id=market_client_oid, max_wait_sec=12.0)
                     phases["market_query"] = q2
                     _apply_fill(float(q2.get("filled") or 0.0), float(q2.get("avg_price") or 0.0))
                     _apply_fee(float(q2.get("fee") or 0.0), str(q2.get("fee_ccy") or ""))
                 elif isinstance(client, BybitClient):
-                    q2 = client.wait_for_fill(symbol=str(symbol), order_id=market_order_id, client_order_id=market_client_oid, max_wait_sec=3.0)
+                    q2 = client.wait_for_fill(symbol=str(symbol), order_id=market_order_id, client_order_id=market_client_oid, max_wait_sec=12.0)
                     phases["market_query"] = q2
                     _apply_fill(float(q2.get("filled") or 0.0), float(q2.get("avg_price") or 0.0))
                     _apply_fee(float(q2.get("fee") or 0.0), str(q2.get("fee_ccy") or ""))
                 elif isinstance(client, CoinbaseExchangeClient):
-                    q2 = client.wait_for_fill(order_id=market_order_id, client_order_id=market_client_oid, max_wait_sec=3.0)
+                    q2 = client.wait_for_fill(order_id=market_order_id, client_order_id=market_client_oid, max_wait_sec=12.0)
                     phases["market_query"] = q2
                     _apply_fill(float(q2.get("filled") or 0.0), float(q2.get("avg_price") or 0.0))
                     _apply_fee(float(q2.get("fee") or 0.0), str(q2.get("fee_ccy") or ""))
                 elif isinstance(client, KrakenClient):
-                    q2 = client.wait_for_fill(order_id=market_order_id, max_wait_sec=3.0)
+                    q2 = client.wait_for_fill(order_id=market_order_id, max_wait_sec=12.0)
                     phases["market_query"] = q2
                     _apply_fill(float(q2.get("filled") or 0.0), float(q2.get("avg_price") or 0.0))
                     _apply_fee(float(q2.get("fee") or 0.0), str(q2.get("fee_ccy") or ""))
                 elif isinstance(client, KrakenFuturesClient):
-                    q2 = client.wait_for_fill(order_id=market_order_id, client_order_id=market_client_oid, max_wait_sec=3.0)
+                    q2 = client.wait_for_fill(order_id=market_order_id, client_order_id=market_client_oid, max_wait_sec=12.0)
                     phases["market_query"] = q2
                     _apply_fill(float(q2.get("filled") or 0.0), float(q2.get("avg_price") or 0.0))
                     _apply_fee(float(q2.get("fee") or 0.0), str(q2.get("fee_ccy") or ""))
                 elif isinstance(client, KucoinSpotClient):
-                    q2 = client.wait_for_fill(order_id=market_order_id, max_wait_sec=3.0)
+                    q2 = client.wait_for_fill(order_id=market_order_id, max_wait_sec=12.0)
                     phases["market_query"] = q2
                     _apply_fill(float(q2.get("filled") or 0.0), float(q2.get("avg_price") or 0.0))
                     _apply_fee(float(q2.get("fee") or 0.0), str(q2.get("fee_ccy") or ""))
                 elif isinstance(client, KucoinFuturesClient):
-                    q2 = client.wait_for_fill(order_id=market_order_id, max_wait_sec=3.0)
+                    q2 = client.wait_for_fill(order_id=market_order_id, max_wait_sec=12.0)
                     phases["market_query"] = q2
                     _apply_fill(float(q2.get("filled") or 0.0), float(q2.get("avg_price") or 0.0))
                     _apply_fee(float(q2.get("fee") or 0.0), str(q2.get("fee_ccy") or ""))
                 elif isinstance(client, GateSpotClient):
-                    q2 = client.wait_for_fill(order_id=market_order_id, max_wait_sec=3.0)
+                    q2 = client.wait_for_fill(order_id=market_order_id, max_wait_sec=12.0)
                     phases["market_query"] = q2
                     _apply_fill(float(q2.get("filled") or 0.0), float(q2.get("avg_price") or 0.0))
                     _apply_fee(float(q2.get("fee") or 0.0), str(q2.get("fee_ccy") or ""))
                 elif isinstance(client, GateUsdtFuturesClient):
-                    q2 = client.wait_for_fill(order_id=market_order_id, contract=to_gate_currency_pair(str(symbol)), max_wait_sec=3.0)
-                    phases["market_query"] = q2
-                    _apply_fill(float(q2.get("filled") or 0.0), float(q2.get("avg_price") or 0.0))
-                    _apply_fee(float(q2.get("fee") or 0.0), str(q2.get("fee_ccy") or ""))
-                elif isinstance(client, BitfinexClient):
-                    q2 = client.wait_for_fill(order_id=market_order_id, max_wait_sec=3.0)
-                    phases["market_query"] = q2
-                    _apply_fill(float(q2.get("filled") or 0.0), float(q2.get("avg_price") or 0.0))
-                    _apply_fee(float(q2.get("fee") or 0.0), str(q2.get("fee_ccy") or ""))
-                elif isinstance(client, BitfinexDerivativesClient):
-                    q2 = client.wait_for_fill(order_id=market_order_id, max_wait_sec=3.0)
+                    q2 = client.wait_for_fill(order_id=market_order_id, contract=to_gate_currency_pair(str(symbol)), max_wait_sec=12.0)
                     phases["market_query"] = q2
                     _apply_fill(float(q2.get("filled") or 0.0), float(q2.get("avg_price") or 0.0))
                     _apply_fee(float(q2.get("fee") or 0.0), str(q2.get("fee_ccy") or ""))
                 elif isinstance(client, DeepcoinClient):
-                    q2 = client.wait_for_fill(symbol=str(symbol), order_id=market_order_id, client_order_id=market_client_oid, max_wait_sec=3.0)
+                    q2 = client.wait_for_fill(symbol=str(symbol), order_id=market_order_id, client_order_id=market_client_oid, max_wait_sec=12.0)
                     phases["market_query"] = q2
                     _apply_fill(float(q2.get("filled") or 0.0), float(q2.get("avg_price") or 0.0))
                     _apply_fee(float(q2.get("fee") or 0.0), str(q2.get("fee_ccy") or ""))
                 elif isinstance(client, HtxClient):
-                    q2 = client.wait_for_fill(symbol=str(symbol), order_id=market_order_id, client_order_id=market_client_oid, max_wait_sec=3.0)
+                    q2 = client.wait_for_fill(symbol=str(symbol), order_id=market_order_id, client_order_id=market_client_oid, max_wait_sec=12.0)
                     phases["market_query"] = q2
                     _apply_fill(float(q2.get("filled") or 0.0), float(q2.get("avg_price") or 0.0))
                     _apply_fee(float(q2.get("fee") or 0.0), str(q2.get("fee_ccy") or ""))
@@ -2099,10 +2065,10 @@ class PendingOrderWorker:
             _notify_live_best_effort(status="failed", error="ibkr_stock_short_not_supported")
             return
 
-        # Map signal to action
+        # Map signal to action (include stop/tp/trailing aliases)
         if sig in ("open_long", "add_long"):
             action = "buy"
-        elif sig in ("close_long", "reduce_long"):
+        elif sig in ("close_long", "reduce_long", "close_long_stop", "close_long_profit", "close_long_trailing"):
             action = "sell"
         else:
             self._mark_failed(order_id=order_id, error=f"ibkr_unsupported_signal:{signal_type}")
@@ -2229,14 +2195,14 @@ class PendingOrderWorker:
 
         sig = str(signal_type or "").strip().lower()
 
-        # Map signal to action
+        # Map signal to action (include stop/tp/trailing aliases)
         if sig in ("open_long", "add_long"):
             action = "buy"
-        elif sig in ("close_long", "reduce_long"):
+        elif sig in ("close_long", "reduce_long", "close_long_stop", "close_long_profit", "close_long_trailing"):
             action = "sell"
         elif sig in ("open_short", "add_short"):
             action = "sell"
-        elif sig in ("close_short", "reduce_short"):
+        elif sig in ("close_short", "reduce_short", "close_short_stop", "close_short_profit", "close_short_trailing"):
             action = "buy"
         else:
             self._mark_failed(order_id=order_id, error=f"mt5_unsupported_signal:{signal_type}")

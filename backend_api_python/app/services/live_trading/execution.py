@@ -2,7 +2,7 @@
 Translate a strategy signal into a direct-exchange order call.
 
 Supports:
-- Crypto exchanges: Binance, OKX, Bitget, Bybit, Coinbase, Kraken, KuCoin, Gate, Bitfinex, Deepcoin, HTX
+- Crypto exchanges: Binance, OKX, Bitget, Bybit, Coinbase, Kraken, KuCoin, Gate, Deepcoin, HTX
 - Traditional brokers: Interactive Brokers (IBKR) for US stocks
 - Forex brokers: MetaTrader 5 (MT5)
 """
@@ -24,7 +24,6 @@ from app.services.live_trading.kraken_futures import KrakenFuturesClient
 from app.services.live_trading.kucoin import KucoinSpotClient
 from app.services.live_trading.kucoin import KucoinFuturesClient
 from app.services.live_trading.gate import GateSpotClient, GateUsdtFuturesClient
-from app.services.live_trading.bitfinex import BitfinexClient, BitfinexDerivativesClient
 
 # Lazy import Deepcoin
 DeepcoinClient = None
@@ -232,10 +231,6 @@ def place_order_from_signal(
         return client.place_market_order(symbol=symbol, side=side, size=gate_size, client_order_id=client_order_id)
     if isinstance(client, GateUsdtFuturesClient):
         return client.place_market_order(symbol=symbol, side=side, size=qty, reduce_only=reduce_only, client_order_id=client_order_id)
-    if isinstance(client, BitfinexClient):
-        return client.place_market_order(symbol=symbol, side=side, size=qty, client_order_id=client_order_id)
-    if isinstance(client, BitfinexDerivativesClient):
-        return client.place_market_order(symbol=symbol, side=side, size=qty, client_order_id=client_order_id)
     if isinstance(client, KrakenFuturesClient):
         return client.place_market_order(symbol=symbol, side=side, size=qty, reduce_only=reduce_only, client_order_id=client_order_id)
 

@@ -179,6 +179,7 @@ class KrakenFuturesClient(BaseRestClient):
         end_ts = time.time() + float(max_wait_sec or 0.0)
         last: Dict[str, Any] = {}
         while True:
+            timed_out = time.time() >= end_ts
             try:
                 last = self.get_order(order_id=str(order_id or ""), client_order_id=str(client_order_id or ""))
             except Exception:
@@ -205,10 +206,16 @@ class KrakenFuturesClient(BaseRestClient):
             if fee > 0:
                 fee_ccy = "USD"
             if filled > 0 and avg_price > 0:
+                if fee <= 0 and not timed_out:
+                    time.sleep(float(poll_interval_sec or 0.5))
+                    continue
                 return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "status": status, "order": last}
             if status.lower() in ("filled", "cancelled", "canceled", "rejected"):
+                if fee <= 0 and filled > 0 and avg_price > 0 and not timed_out:
+                    time.sleep(float(poll_interval_sec or 0.5))
+                    continue
                 return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "status": status, "order": last}
-            if time.time() >= end_ts:
+            if timed_out:
                 return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "status": status, "order": last}
             time.sleep(float(poll_interval_sec or 0.5))
 

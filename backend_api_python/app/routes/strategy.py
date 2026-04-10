@@ -27,6 +27,21 @@ logger = get_logger(__name__)
 
 strategy_bp = Blueprint('strategy', __name__)
 
+
+def _normalize_trade_row_for_api(trade: dict) -> dict:
+    """Ensure numeric fields are JSON-friendly floats (PostgreSQL DECIMAL → float)."""
+    try:
+        from decimal import Decimal
+    except Exception:  # pragma: no cover
+        Decimal = ()  # type: ignore
+    out = dict(trade)
+    for k in ("price", "amount", "value", "commission", "profit"):
+        v = out.get(k)
+        if isinstance(v, Decimal):
+            out[k] = float(v)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Strategy templates (loaded once from JSON file)
 # ---------------------------------------------------------------------------
@@ -542,25 +557,30 @@ def get_trades():
             rows = cur.fetchall() or []
             cur.close()
         
-        # Convert created_at to UTC timestamp (seconds) for frontend
-        # This ensures consistent timezone handling
+        # Convert created_at to Unix seconds (UTC instant).
+        # qd_strategy_trades.created_at is TIMESTAMP WITHOUT TIME ZONE; with PostgreSQL session UTC
+        # the stored wall clock is UTC. Naive datetime must not use .timestamp() alone — that would
+        # interpret it in the Python process local TZ and shift the instant (e.g. +8h on CN laptops).
+        from datetime import datetime as _dt, timezone as _tz
         processed_rows = []
         for row in rows:
             trade = dict(row)
             created_at = trade.get('created_at')
             if created_at:
                 if hasattr(created_at, 'timestamp'):
-                    # datetime object - convert to UTC timestamp
-                    trade['created_at'] = int(created_at.timestamp())
+                    dt = created_at
+                    if getattr(dt, 'tzinfo', None) is None:
+                        dt = dt.replace(tzinfo=_tz.utc)
+                    trade['created_at'] = int(dt.timestamp())
                 elif isinstance(created_at, str):
-                    # ISO string - parse and convert
                     try:
-                        from datetime import datetime
-                        dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                        dt = _dt.fromisoformat(created_at.replace('Z', '+00:00'))
+                        if getattr(dt, 'tzinfo', None) is None:
+                            dt = dt.replace(tzinfo=_tz.utc)
                         trade['created_at'] = int(dt.timestamp())
                     except Exception:
                         pass
-            processed_rows.append(trade)
+            processed_rows.append(_normalize_trade_row_for_api(trade))
         
         # Frontend expects data.trades; keep data.items for compatibility with list-style components.
         return jsonify({'code': 1, 'msg': 'success', 'data': {'trades': processed_rows, 'items': processed_rows}})
@@ -1491,6 +1511,9 @@ def get_strategy_logs():
             if not isinstance(r, dict):
                 continue
             rr = dict(r)
+            msg = str(rr.get('message') or '')
+            if msg.startswith('tick price=') or msg.startswith('tick price '):
+                continue
             ts = rr.get('timestamp')
             if ts is not None and hasattr(ts, 'isoformat'):
                 rr['timestamp'] = ts.isoformat()

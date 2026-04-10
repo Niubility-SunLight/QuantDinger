@@ -418,7 +418,6 @@ flowchart TB
 | Kraken | 现货、期货 |
 | KuCoin | 现货、期货 |
 | Gate.io | 现货、期货 |
-| Bitfinex | 现货、衍生品 |
 
 ### 传统经纪商和市场
 

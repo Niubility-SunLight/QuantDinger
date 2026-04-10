@@ -7,14 +7,17 @@ API docs (reference):
 
 from __future__ import annotations
 
-import hmac
 import hashlib
+import hmac
+import logging
 import time
 from decimal import Decimal, ROUND_DOWN
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlencode
 
 from app.services.live_trading.base import BaseRestClient, LiveOrderResult, LiveTradingError
+
+logger = logging.getLogger(__name__)
 from app.services.live_trading.symbols import to_binance_futures_symbol
 
 
@@ -483,6 +486,19 @@ class BinanceFuturesClient(BaseRestClient):
                 if (not fee_ccy) and ccy:
                     fee_ccy = ccy
         return float(total_fee), str(fee_ccy or "")
+
+    def get_fee_rate(self, symbol: str, market_type: str = "swap") -> Optional[Dict[str, float]]:
+        sym = symbol.upper().replace("-", "").replace("/", "")
+        try:
+            data = self._signed_request("GET", "/fapi/v1/commissionRate", params={"symbol": sym})
+            if isinstance(data, dict):
+                maker = abs(float(data.get("makerCommissionRate") or 0))
+                taker = abs(float(data.get("takerCommissionRate") or 0))
+                if maker > 0 or taker > 0:
+                    return {"maker": maker, "taker": taker}
+        except Exception as e:
+            logger.warning(f"Binance get_fee_rate({symbol}) failed: {e}")
+        return None
 
     def set_leverage(self, *, symbol: str, leverage: float) -> Dict[str, Any]:
         """

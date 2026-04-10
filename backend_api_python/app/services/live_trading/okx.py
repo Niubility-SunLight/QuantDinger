@@ -10,12 +10,15 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import logging
 import time
 from decimal import Decimal, ROUND_DOWN
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlencode
 
 from app.services.live_trading.base import BaseRestClient, LiveOrderResult, LiveTradingError
+
+logger = logging.getLogger(__name__)
 from app.services.live_trading.symbols import to_okx_swap_inst_id, to_okx_spot_inst_id
 
 
@@ -402,6 +405,22 @@ class OkxClient(BaseRestClient):
         Private endpoint to validate credentials (best-effort).
         """
         return self._signed_request("GET", "/api/v5/account/balance")
+
+    def get_fee_rate(self, symbol: str, market_type: str = "swap") -> Optional[Dict[str, float]]:
+        inst_type = "SPOT" if market_type == "spot" else "SWAP"
+        inst_id = symbol.upper()
+        try:
+            raw = self._signed_request("GET", "/api/v5/account/trade-fee", params={"instType": inst_type, "instId": inst_id})
+            data = (raw.get("data") or []) if isinstance(raw, dict) else []
+            if data and isinstance(data[0], dict):
+                rec = data[0]
+                maker = abs(float(rec.get("maker") or rec.get("makerU") or 0))
+                taker = abs(float(rec.get("taker") or rec.get("takerU") or 0))
+                if maker > 0 or taker > 0:
+                    return {"maker": maker, "taker": taker}
+        except Exception as e:
+            logger.warning(f"OKX get_fee_rate({symbol}) failed: {e}")
+        return None
 
     def get_positions(self, *, inst_id: str = "", inst_type: str = "SWAP") -> Dict[str, Any]:
         """

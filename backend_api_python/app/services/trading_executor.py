@@ -58,6 +58,10 @@ class TradingExecutor:
         
         # 单实例线程上限，避免无限制创建线程导致 can't start new thread/OOM
         self.max_threads = int(os.getenv('STRATEGY_MAX_THREADS', '64'))
+
+        # Per-strategy exchange fee-rate cache: {strategy_id: {"maker": float, "taker": float}}
+        self._exchange_fee_cache: Dict[int, Optional[Dict[str, float]]] = {}
+        self._exchange_fee_cache_lock = threading.Lock()
         
         # 确保数据库字段存在
         self._ensure_db_columns()
@@ -431,7 +435,7 @@ class TradingExecutor:
                 
                 logger.info(f"Strategy {strategy_id} started")
                 self._console_print(f"[strategy:{strategy_id}] started")
-                append_strategy_log(strategy_id, "info", "策略执行线程已启动")
+                append_strategy_log(strategy_id, "info", "Strategy execution thread started")
                 return True
                 
         except Exception as e:
@@ -467,10 +471,11 @@ class TradingExecutor:
                 
                 # 从运行列表中移除（线程会在下次循环检查状态时退出）
                 del self.running_strategies[strategy_id]
+                self._exchange_fee_cache.pop(strategy_id, None)
                 
                 logger.info(f"Strategy {strategy_id} stopped")
                 self._console_print(f"[strategy:{strategy_id}] stopped (requested)")
-                append_strategy_log(strategy_id, "info", "已请求停止策略（运行标志已清除）")
+                append_strategy_log(strategy_id, "info", "Strategy stop requested (run flag cleared)")
                 return True
                 
         except Exception as e:
@@ -843,7 +848,15 @@ class TradingExecutor:
 
             # 初始化交易所连接（信号模式下无需真实连接）
             exchange = None
-            
+
+            # Best-effort: query the real fee tier from the exchange (cached per strategy)
+            exchange_config = strategy.get('exchange_config') or {}
+            if exchange_config and exchange_config.get('api_key') or exchange_config.get('apiKey'):
+                try:
+                    self._query_exchange_fee_rate(strategy_id, exchange_config, symbol, market_type)
+                except Exception as e:
+                    logger.debug(f"Strategy {strategy_id} skipped fee-rate query: {e}")
+
             # ============================================
             # 初始化阶段：获取历史K线并计算指标
             # ============================================
@@ -941,7 +954,7 @@ class TradingExecutor:
             append_strategy_log(
                 strategy_id,
                 "info",
-                f"实盘循环就绪 {symbol} {timeframe}，待处理信号 {len(pending_signals or [])} 条",
+                f"Live loop ready {symbol} {timeframe}, pending signals: {len(pending_signals or [])}",
             )
             
             # ============================================
@@ -1271,7 +1284,7 @@ class TradingExecutor:
                                 append_strategy_log(
                                     strategy_id,
                                     "signal",
-                                    f"已提交信号 {signal_type} 参考价 {float(execute_price or 0):.6f}",
+                                    f"Signal submitted: {signal_type} @ {float(execute_price or 0):.6f}",
                                 )
                                 # Notify portfolio positions linked to this symbol
                                 try:
@@ -1280,7 +1293,7 @@ class TradingExecutor:
                                         market=market_type or 'Crypto',
                                         symbol=symbol,
                                         signal_type=signal_type,
-                                        signal_detail=f"策略: {strategy_name}\n信号: {signal_type}\n价格: {execute_price:.4f}"
+                                        signal_detail=f"Strategy: {strategy_name}\nSignal: {signal_type}\nPrice: {execute_price:.4f}"
                                     )
                                 except Exception as link_e:
                                     logger.warning(f"Strategy signal linkage notification failed: {link_e}")
@@ -1289,7 +1302,7 @@ class TradingExecutor:
                                 append_strategy_log(
                                     strategy_id,
                                     "error",
-                                    f"信号未执行或拒单: {signal_type}",
+                                    f"Signal rejected or not executed: {signal_type}",
                                 )
 
                     # Update positions once per tick.
@@ -1299,25 +1312,14 @@ class TradingExecutor:
                     self._console_print(
                         f"[strategy:{strategy_id}] tick price={float(current_price or 0.0):.8f} pending_signals={len(pending_signals or [])}"
                     )
-                    try:
-                        nowl = time.time()
-                        lastl = float(self._strategy_ui_log_last_tick_ts.get(strategy_id) or 0.0)
-                        if nowl - lastl >= 55.0:
-                            self._strategy_ui_log_last_tick_ts[strategy_id] = nowl
-                            append_strategy_log(
-                                strategy_id,
-                                "info",
-                                f"tick price={float(current_price or 0.0):.8f} pending_signals={len(pending_signals or [])}",
-                            )
-                    except Exception:
-                        pass
+                    # Tick heartbeat kept for console only; no longer persisted to qd_strategy_logs.
                     
                 except Exception as e:
                     logger.error(f"Strategy {strategy_id} loop error: {str(e)}")
                     logger.error(traceback.format_exc())
                     self._console_print(f"[strategy:{strategy_id}] loop error: {e}")
                     try:
-                        append_strategy_log(strategy_id, "error", f"循环异常: {e}")
+                        append_strategy_log(strategy_id, "error", f"Loop error: {e}")
                     except Exception:
                         pass
                     time.sleep(5)
@@ -1327,7 +1329,7 @@ class TradingExecutor:
             logger.error(traceback.format_exc())
             self._console_print(f"[strategy:{strategy_id}] fatal error: {e}")
             try:
-                append_strategy_log(strategy_id, "error", f"策略线程致命错误: {e}")
+                append_strategy_log(strategy_id, "error", f"Strategy thread fatal error: {e}")
             except Exception:
                 pass
         finally:
@@ -1338,7 +1340,7 @@ class TradingExecutor:
             self._console_print(f"[strategy:{strategy_id}] loop exited")
             logger.info(f"Strategy {strategy_id} loop exited")
             try:
-                append_strategy_log(strategy_id, "info", "策略执行循环已退出")
+                append_strategy_log(strategy_id, "info", "Strategy execution loop exited")
             except Exception:
                 pass
     
@@ -1458,6 +1460,31 @@ class TradingExecutor:
         """
         return None
     
+    def _query_exchange_fee_rate(
+        self,
+        strategy_id: int,
+        exchange_config: Dict[str, Any],
+        symbol: str,
+        market_type: str = "swap",
+    ) -> Optional[Dict[str, float]]:
+        """Query and cache the account's real fee-rate from the exchange."""
+        with self._exchange_fee_cache_lock:
+            if strategy_id in self._exchange_fee_cache:
+                return self._exchange_fee_cache[strategy_id]
+        try:
+            from app.services.live_trading.factory import query_fee_rate
+            result = query_fee_rate(exchange_config, symbol, market_type=market_type)
+            with self._exchange_fee_cache_lock:
+                self._exchange_fee_cache[strategy_id] = result
+            if result:
+                logger.info(f"Strategy {strategy_id} exchange fee rate: maker={result['maker']}, taker={result['taker']}")
+            return result
+        except Exception as e:
+            logger.warning(f"Strategy {strategy_id} failed to query exchange fee rate: {e}")
+            with self._exchange_fee_cache_lock:
+                self._exchange_fee_cache[strategy_id] = None
+            return None
+
     def _fetch_latest_kline(self, symbol: str, timeframe: str, limit: int = 500, market_category: str = 'Crypto') -> List[Dict[str, Any]]:
         """获取最新K线数据（优先从缓存获取）
         
@@ -2435,10 +2462,21 @@ class TradingExecutor:
                     return True
 
                 # 更新数据库状态 (signal mode / local simulation)
+                # Prefer real exchange fee-rate; fall back to user-configured rate
+                _exchange_fee = self._exchange_fee_cache.get(strategy_id)
+                if _exchange_fee and _exchange_fee.get('taker', 0) > 0:
+                    _comm_rate = _exchange_fee['taker']
+                else:
+                    _comm_rate = float((trading_config or {}).get('commission', 0) or 0) / 100.0
+                    if _comm_rate <= 0:
+                        _comm_rate = 0.001
+                _est_commission = round(float(current_price or 0) * float(amount or 0) * _comm_rate, 8)
+
                 if 'open' in sig or 'add' in sig:
                     self._record_trade(
                         strategy_id=strategy_id, symbol=symbol, type=signal_type,
-                        price=current_price, amount=amount, value=amount*current_price
+                        price=current_price, amount=amount, value=amount*current_price,
+                        commission=_est_commission
                     )
                     side = 'short' if 'short' in signal_type else 'long'
                     
@@ -2466,18 +2504,18 @@ class TradingExecutor:
                     old_size = float(old_pos.get('size') or 0.0)
                     old_entry = float(old_pos.get('entry_price') or 0.0)
                     
-                    # 计算减仓部分的盈亏（信号模式下，不含手续费）
                     reduce_profit = None
                     if old_entry > 0 and amount > 0:
                         if side == 'long':
                             reduce_profit = (current_price - old_entry) * amount
                         else:
                             reduce_profit = (old_entry - current_price) * amount
-                    
+                        reduce_profit = round(reduce_profit - _est_commission, 8)
+
                     self._record_trade(
                         strategy_id=strategy_id, symbol=symbol, type=signal_type,
                         price=current_price, amount=amount, value=amount*current_price,
-                        profit=reduce_profit
+                        profit=reduce_profit, commission=_est_commission
                     )
                     
                     new_size = max(0.0, old_size - float(amount or 0.0))
@@ -2493,7 +2531,6 @@ class TradingExecutor:
                     side = 'short' if 'short' in signal_type else 'long'
                     old_pos = next((p for p in current_positions if p.get('side') == side), None)
                     
-                    # 计算盈亏（信号模式下，不含手续费）
                     close_profit = None
                     if old_pos:
                         entry_price = float(old_pos.get('entry_price') or 0)
@@ -2502,11 +2539,12 @@ class TradingExecutor:
                                 close_profit = (current_price - entry_price) * amount
                             else:
                                 close_profit = (entry_price - current_price) * amount
-                    
+                            close_profit = round(close_profit - _est_commission, 8)
+
                     self._record_trade(
                         strategy_id=strategy_id, symbol=symbol, type=signal_type,
                         price=current_price, amount=amount, value=amount*current_price,
-                        profit=close_profit
+                        profit=close_profit, commission=_est_commission
                     )
                     self._close_position(strategy_id, symbol, side)
 
