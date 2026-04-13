@@ -13,7 +13,10 @@
     <a href="docs/README_CN.md"><strong>简体中文</strong></a> &nbsp;·&nbsp;
     <a href="https://ai.quantdinger.com"><strong>Live Demo</strong></a> &nbsp;·&nbsp;
     <a href="https://youtu.be/HPTVpqL7knM"><strong>Video Demo</strong></a> &nbsp;·&nbsp;
-    <a href="https://www.quantdinger.com"><strong>Community</strong></a>
+    <a href="https://www.quantdinger.com"><strong>Website</strong></a> &nbsp;·&nbsp;
+    <a href="https://t.me/quantdinger"><strong>Telegram</strong></a> &nbsp;·&nbsp;
+    <a href="https://discord.com/invite/tyx5B6TChr"><strong>Discord</strong></a> &nbsp;·&nbsp;
+    <a href="https://youtube.com/@quantdinger"><strong>YouTube</strong></a>
   </p>
 
   <p>
