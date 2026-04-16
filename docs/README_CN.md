@@ -589,7 +589,7 @@ QuantDinger/
 
 - Website: [quantdinger.com](https://quantdinger.com)
 - Telegram: [t.me/worldinbroker](https://t.me/worldinbroker)
-- Email: [brokermr810@gmail.com](mailto:brokermr810@gmail.com)
+- Email: [support@quantdinger.com](mailto:support@quantdinger.com)
 
 ## 法律声明与合规提示
 
@@ -618,7 +618,7 @@ QuantDinger/
 
 - [贡献指南](../CONTRIBUTING.md)
 - [问题反馈 / 功能建议](https://github.com/brokermr810/QuantDinger/issues)
-- Email: [brokermr810@gmail.com](mailto:brokermr810@gmail.com)
+- Email: [support@quantdinger.com](mailto:support@quantdinger.com)
 
 ## 支持项目
 

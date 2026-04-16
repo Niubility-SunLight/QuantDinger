@@ -590,7 +590,7 @@ For commercial licensing, frontend source access, branding authorization, or dep
 
 - Website: [quantdinger.com](https://quantdinger.com)
 - Telegram: [t.me/worldinbroker](https://t.me/worldinbroker)
-- Email: [brokermr810@gmail.com](mailto:brokermr810@gmail.com)
+- Email: [support@quantdinger.com](mailto:support@quantdinger.com)
 
 ## Legal Notice and Compliance
 
@@ -619,7 +619,7 @@ For commercial licensing, frontend source access, branding authorization, or dep
 
 - [Contributing Guide](CONTRIBUTING.md)
 - [Report Bugs / Request Features](https://github.com/brokermr810/QuantDinger/issues)
-- Email: [brokermr810@gmail.com](mailto:brokermr810@gmail.com)
+- Email: [support@quantdinger.com](mailto:support@quantdinger.com)
 
 ## Support the Project
 

@@ -82,5 +82,5 @@ Commercial licensing can include:
 ## 7) Contact
 
 - Telegram: `https://t.me/worldinbroker`
-- Email: `mailto:brokermr810@gmail.com`
+- Email: `mailto:support@quantdinger.com`
 
