@@ -150,6 +150,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   - `backend_api_python/app/routes/__init__.py`
   - `backend_api_python/app/utils/config_loader.py`
 
+## Skills
+
+- `/gen-api-docs` — 扫描 `backend_api_python/app/routes/` 下所有路由，提取接口定义，生成/更新 `interfaceDocs/interface-V{n}.md` 版本化接口文档，并比较与上一版本的差异。
+
 ## CI 与仓库边界
 
 - `.github/workflows/basic-ci.yml` 不会启动完整应用栈，也不是全量集成测试。
