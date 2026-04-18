@@ -844,17 +844,24 @@ def change_password():
 
 @auth_bp.route('/oauth/google', methods=['GET'])
 def oauth_google():
-    """Redirect to Google OAuth authorization page"""
+    """Redirect to Google OAuth authorization page.
+
+    Query params:
+        redirect: optional front-end URL (must be allow-listed). When provided,
+                  after successful login the user is redirected there instead of
+                  the default FRONTEND_URL. Supports multi-frontend (PC + mobile).
+    """
     try:
         from app.services.oauth_service import get_oauth_service
         oauth = get_oauth_service()
-        
+
         if not oauth.google_enabled:
             return jsonify({'code': 0, 'msg': 'Google OAuth is not configured', 'data': None}), 400
-        
-        auth_url, state = oauth.get_google_auth_url()
+
+        redirect_url = (request.args.get('redirect') or '').strip()
+        auth_url, state = oauth.get_google_auth_url(redirect_url=redirect_url)
         return redirect(auth_url)
-        
+
     except Exception as e:
         logger.error(f"oauth_google error: {e}")
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
@@ -876,15 +883,18 @@ def oauth_google_callback():
         code = request.args.get('code')
         state = request.args.get('state')
         error = request.args.get('error')
-        
-        frontend_url = oauth.frontend_url
-        
+
+        # Peek the per-state redirect (set when the flow was initiated) before
+        # handle_* consumes the state; fall back to default FRONTEND_URL.
+        state_redirect = oauth.peek_state_redirect(state) if state else ''
+        frontend_url = state_redirect or oauth.frontend_url
+
         if error:
             return redirect(_build_frontend_login_redirect(frontend_url, oauth_error=error))
-        
+
         if not code or not state:
             return redirect(_build_frontend_login_redirect(frontend_url, oauth_error='missing_params'))
-        
+
         # Handle callback
         success, result = oauth.handle_google_callback(code, state)
         if not success:
@@ -930,17 +940,22 @@ def oauth_google_callback():
 
 @auth_bp.route('/oauth/github', methods=['GET'])
 def oauth_github():
-    """Redirect to GitHub OAuth authorization page"""
+    """Redirect to GitHub OAuth authorization page.
+
+    Query params:
+        redirect: optional front-end URL (must be allow-listed), see oauth_google.
+    """
     try:
         from app.services.oauth_service import get_oauth_service
         oauth = get_oauth_service()
-        
+
         if not oauth.github_enabled:
             return jsonify({'code': 0, 'msg': 'GitHub OAuth is not configured', 'data': None}), 400
-        
-        auth_url, state = oauth.get_github_auth_url()
+
+        redirect_url = (request.args.get('redirect') or '').strip()
+        auth_url, state = oauth.get_github_auth_url(redirect_url=redirect_url)
         return redirect(auth_url)
-        
+
     except Exception as e:
         logger.error(f"oauth_github error: {e}")
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
@@ -962,15 +977,16 @@ def oauth_github_callback():
         code = request.args.get('code')
         state = request.args.get('state')
         error = request.args.get('error')
-        
-        frontend_url = oauth.frontend_url
-        
+
+        state_redirect = oauth.peek_state_redirect(state) if state else ''
+        frontend_url = state_redirect or oauth.frontend_url
+
         if error:
             return redirect(_build_frontend_login_redirect(frontend_url, oauth_error=error))
-        
+
         if not code or not state:
             return redirect(_build_frontend_login_redirect(frontend_url, oauth_error='missing_params'))
-        
+
         # Handle callback
         success, result = oauth.handle_github_callback(code, state)
         if not success:

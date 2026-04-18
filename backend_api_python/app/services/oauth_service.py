@@ -4,7 +4,7 @@ OAuth Service - Handles Google and GitHub OAuth authentication.
 import os
 import secrets
 import requests
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 from datetime import datetime
 from typing import Tuple, Optional, Dict, Any
 from app.utils.db import get_db_connection
@@ -46,26 +46,70 @@ class OAuthService:
         
         # Frontend URL for redirect after OAuth
         self.frontend_url = os.getenv('FRONTEND_URL', 'http://localhost:8080')
-        
+
+        # Allow-listed origins that may be used as post-login redirect targets
+        # (comma-separated). FRONTEND_URL is always allowed.
+        raw_allowed = os.getenv('OAUTH_ALLOWED_REDIRECTS', '')
+        extra = [x.strip() for x in raw_allowed.split(',') if x.strip()]
+        self.allowed_redirect_origins = set()
+        for item in [self.frontend_url] + extra:
+            origin = self._normalize_origin(item)
+            if origin:
+                self.allowed_redirect_origins.add(origin)
+
         # State storage (in-memory for simplicity, could use Redis in production)
         self._states = {}
-    
+
+    @staticmethod
+    def _normalize_origin(url: str) -> str:
+        """Return scheme://host[:port] for a URL, empty string if invalid."""
+        if not url:
+            return ''
+        try:
+            parsed = urlparse(url if '://' in url else f'https://{url}')
+            if not parsed.scheme or not parsed.netloc:
+                return ''
+            return f"{parsed.scheme}://{parsed.netloc}".lower().rstrip('/')
+        except Exception:
+            return ''
+
+    def is_redirect_allowed(self, redirect_url: str) -> bool:
+        """Check whether the given URL origin is on the allow-list."""
+        origin = self._normalize_origin(redirect_url)
+        if not origin:
+            return False
+        return origin in self.allowed_redirect_origins
+
+    def peek_state_redirect(self, state: str) -> str:
+        """Read the redirect URL associated with a pending OAuth state (no deletion)."""
+        if not state:
+            return ''
+        entry = self._states.get(state) or {}
+        return entry.get('redirect') or ''
+
     # =========================================================================
     # Google OAuth
     # =========================================================================
-    
-    def get_google_auth_url(self, state: str = None) -> Tuple[str, str]:
+
+    def get_google_auth_url(self, state: str = None, redirect_url: str = None) -> Tuple[str, str]:
         """
         Generate Google OAuth authorization URL.
-        
+
+        Args:
+            state: Optional preset state token.
+            redirect_url: Optional front-end URL to redirect back to after login.
+                          Must be in the allow-list, otherwise ignored.
         Returns:
             (auth_url, state)
         """
         if not self.google_enabled:
             return '', ''
-        
+
         state = state or secrets.token_urlsafe(32)
-        self._states[state] = {'provider': 'google', 'created_at': datetime.now()}
+        state_data = {'provider': 'google', 'created_at': datetime.now()}
+        if redirect_url and self.is_redirect_allowed(redirect_url):
+            state_data['redirect'] = redirect_url
+        self._states[state] = state_data
         
         params = {
             'client_id': self.google_client_id,
@@ -149,18 +193,21 @@ class OAuthService:
     # GitHub OAuth
     # =========================================================================
     
-    def get_github_auth_url(self, state: str = None) -> Tuple[str, str]:
+    def get_github_auth_url(self, state: str = None, redirect_url: str = None) -> Tuple[str, str]:
         """
         Generate GitHub OAuth authorization URL.
-        
+
         Returns:
             (auth_url, state)
         """
         if not self.github_enabled:
             return '', ''
-        
+
         state = state or secrets.token_urlsafe(32)
-        self._states[state] = {'provider': 'github', 'created_at': datetime.now()}
+        state_data = {'provider': 'github', 'created_at': datetime.now()}
+        if redirect_url and self.is_redirect_allowed(redirect_url):
+            state_data['redirect'] = redirect_url
+        self._states[state] = state_data
         
         params = {
             'client_id': self.github_client_id,

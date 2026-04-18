@@ -36,7 +36,7 @@ class UsdtPaymentService:
             "xpub_trc20": (os.getenv("USDT_TRC20_XPUB", "") or "").strip(),
             "trongrid_base": (os.getenv("TRONGRID_BASE_URL", "https://api.trongrid.io") or "").strip().rstrip("/"),
             "trongrid_key": (os.getenv("TRONGRID_API_KEY", "") or "").strip(),
-            "usdt_trc20_contract": (os.getenv("USDT_TRC20_CONTRACT", "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj") or "").strip(),
+            "usdt_trc20_contract": (os.getenv("USDT_TRC20_CONTRACT", "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t") or "").strip(),
             "confirm_seconds": int(float(os.getenv("USDT_PAY_CONFIRM_SECONDS", "30") or 30)),
             "order_expire_minutes": int(float(os.getenv("USDT_PAY_EXPIRE_MINUTES", "30") or 30)),
         }
