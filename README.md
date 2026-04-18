@@ -12,7 +12,7 @@
     <a href="README.md"><strong>English</strong></a> &nbsp;·&nbsp;
     <a href="docs/README_CN.md"><strong>简体中文</strong></a> &nbsp;·&nbsp;
     <a href="https://ai.quantdinger.com"><strong>Live Demo</strong></a> &nbsp;·&nbsp;
-    <a href="https://youtu.be/HPTVpqL7knM"><strong>Video Demo</strong></a> &nbsp;·&nbsp;
+    <a href="https://www.youtube.com/watch?v=tNAZ9uMiUUw"><strong>Video Demo</strong></a> &nbsp;·&nbsp;
     <a href="https://www.quantdinger.com"><strong>Website</strong></a> &nbsp;·&nbsp;
     <a href="https://t.me/quantdinger"><strong>Telegram</strong></a> &nbsp;·&nbsp;
     <a href="https://discord.com/invite/tyx5B6TChr"><strong>Discord</strong></a> &nbsp;·&nbsp;
@@ -21,7 +21,7 @@
 
   <p>
     <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg?style=flat-square&logo=apache" alt="License"></a>
-    <img src="https://img.shields.io/badge/Version-3.0.1-orange?style=flat-square" alt="Version">
+    <img src="https://img.shields.io/badge/Version-3.0.2-orange?style=flat-square" alt="Version">
     <img src="https://img.shields.io/badge/Python-3.10%2B%20%7C%20Docker%20image%203.12-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python">
     <img src="https://img.shields.io/badge/Docker-Compose%20Ready-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
     <img src="https://img.shields.io/badge/Frontend-Prebuilt-1f8b4c?style=flat-square" alt="Frontend">
@@ -106,7 +106,17 @@ QuantDinger gives you something most trading tools do not:
 <table align="center" width="100%">
   <tr>
     <td colspan="2" align="center">
-      <a href="https://youtu.be/HPTVpqL7knM"><img src="docs/screenshots/video_demo.png" alt="Video Demo" width="80%" style="border-radius: 8px;"></a>
+      <a href="https://www.youtube.com/watch?v=tNAZ9uMiUUw">
+        <img src="docs/screenshots/video_demo.png" alt="Video Demo" width="80%" style="border-radius: 12px;">
+      </a>
+      <br/>
+      <sub>
+        <a href="https://www.youtube.com/watch?v=tNAZ9uMiUUw">
+          <strong>▶ Watch Product Demo on YouTube</strong>
+        </a>
+      </sub>
+      <br/>
+      <sub>Click the preview card above to open the full video walkthrough.</sub>
     </td>
   </tr>
   <tr>
@@ -451,6 +461,8 @@ For the full developer workflow, see:
 - [Cross-Sectional Strategy Guide](docs/CROSS_SECTIONAL_STRATEGY_GUIDE_EN.md)
 - [Strategy Examples](docs/examples/)
 
+The example scripts live in `docs/examples/` and are kept aligned with the current strategy development guides.
+
 ## Repository Layout
 
 ```text
@@ -578,7 +590,7 @@ For commercial licensing, frontend source access, branding authorization, or dep
 
 - Website: [quantdinger.com](https://quantdinger.com)
 - Telegram: [t.me/worldinbroker](https://t.me/worldinbroker)
-- Email: [brokermr810@gmail.com](mailto:brokermr810@gmail.com)
+- Email: [support@quantdinger.com](mailto:support@quantdinger.com)
 
 ## Legal Notice and Compliance
 
@@ -591,9 +603,9 @@ For commercial licensing, frontend source access, branding authorization, or dep
 
 ## Start Here
 
-- **Want to see the product first?** Open the [Live Demo](https://ai.quantdinger.com) or watch the [Video Demo](https://youtu.be/HPTVpqL7knM).
+- **Want to see the product first?** Open the [Live Demo](https://ai.quantdinger.com) or watch the [Video Demo](https://www.youtube.com/watch?v=tNAZ9uMiUUw).
 - **Want to self-host quickly?** Go straight to [Quick Start](#quick-start) and launch with Docker Compose.
-- **Want to build strategies?** Read the [Strategy Development Guide](docs/STRATEGY_DEV_GUIDE.md).
+- **Want to build strategies?** Read the [Strategy Development Guide](docs/STRATEGY_DEV_GUIDE.md). Example scripts live in [`docs/examples/`](docs/examples/) and are kept aligned with the guide.
 - **Want cloud or production deployment?** Use the [Cloud Deployment Guide](docs/CLOUD_DEPLOYMENT_EN.md).
 - **Want to license or customize it for a business?** Contact the team through [quantdinger.com](https://quantdinger.com).
 
@@ -607,7 +619,7 @@ For commercial licensing, frontend source access, branding authorization, or dep
 
 - [Contributing Guide](CONTRIBUTING.md)
 - [Report Bugs / Request Features](https://github.com/brokermr810/QuantDinger/issues)
-- Email: [brokermr810@gmail.com](mailto:brokermr810@gmail.com)
+- Email: [support@quantdinger.com](mailto:support@quantdinger.com)
 
 ## Support the Project
 
@@ -616,6 +628,10 @@ Crypto donations:
 ```text
 0x96fa4962181bea077f8c7240efe46afbe73641a7
 ```
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=brokermr810/QuantDinger&type=Date)](https://star-history.com/#brokermr810/QuantDinger&Date)
 
 ## Acknowledgements
 

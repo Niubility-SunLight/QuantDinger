@@ -2,7 +2,7 @@
 Trading Strategy API Routes
 """
 from flask import Blueprint, request, jsonify, g
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import re
 import traceback
@@ -40,6 +40,191 @@ def _normalize_trade_row_for_api(trade: dict) -> dict:
         if isinstance(v, Decimal):
             out[k] = float(v)
     return out
+
+
+def _analyze_strategy_code_quality(code: str) -> list[dict]:
+    hints = []
+    raw = (code or "").strip()
+    if not raw:
+        return [{"severity": "error", "code": "EMPTY_CODE", "params": {}}]
+
+    has_on_init = bool(re.search(r"^\s*def\s+on_init\s*\(", raw, re.MULTILINE))
+    has_on_bar = bool(re.search(r"^\s*def\s+on_bar\s*\(", raw, re.MULTILINE))
+    has_ctx_param = bool(re.search(r"\bctx\.param\s*\(", raw))
+    has_order_intent = bool(re.search(r"\bctx\.(buy|sell|close_position)\s*\(", raw))
+
+    if not has_on_init:
+        hints.append({"severity": "warn", "code": "MISSING_ON_INIT", "params": {}})
+    if not has_on_bar:
+        hints.append({"severity": "error", "code": "MISSING_ON_BAR", "params": {}})
+    if not has_ctx_param:
+        hints.append({"severity": "info", "code": "NO_CTX_PARAM_DEFAULTS", "params": {}})
+    if not has_order_intent:
+        hints.append({"severity": "info", "code": "NO_ORDER_INTENT", "params": {}})
+    return hints
+
+
+def _validate_strategy_code_internal(code: str) -> dict:
+    from app.services.strategy_script_runtime import compile_strategy_script_handlers
+
+    raw = (code or "").strip()
+    hints = _analyze_strategy_code_quality(raw)
+    if not raw:
+        return {
+            "success": False,
+            "message": "Code is empty",
+            "error_type": "EmptyCode",
+            "details": None,
+            "hints": hints,
+        }
+
+    try:
+        compile(raw, '<strategy>', 'exec')
+    except SyntaxError as se:
+        return {
+            "success": False,
+            "message": f"Syntax error at line {se.lineno}: {se.msg}",
+            "error_type": "SyntaxError",
+            "details": str(se),
+            "hints": hints,
+        }
+
+    required_funcs = ['on_bar', 'on_init']
+    found = [f for f in required_funcs if f'def {f}' in raw]
+    missing = [f for f in required_funcs if f not in found]
+    if missing:
+        return {
+            "success": False,
+            "message": f"Missing required functions: {', '.join(missing)}",
+            "error_type": "MissingFunctions",
+            "details": None,
+            "hints": hints,
+        }
+
+    try:
+        compile_strategy_script_handlers(raw)
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Runtime Error: {e}",
+            "error_type": "RuntimeError",
+            "details": str(e),
+            "hints": hints,
+        }
+
+    return {
+        "success": True,
+        "message": "Code verification passed",
+        "error_type": None,
+        "details": None,
+        "hints": hints,
+    }
+
+
+def _strategy_debug_summary(validation: dict | None = None) -> dict:
+    validation = validation or {}
+    hints = validation.get("hints") or []
+    return {
+        "success": bool(validation.get("success")),
+        "message": validation.get("message"),
+        "error_type": validation.get("error_type"),
+        "hint_codes": [h.get("code") for h in hints if h.get("code")],
+        "hint_count": len(hints),
+    }
+
+
+def _request_lang(default: str = "zh-CN") -> str:
+    raw = (
+        request.headers.get("X-App-Lang")
+        or request.headers.get("Accept-Language")
+        or default
+    )
+    lang = str(raw or default).split(",", 1)[0].strip()
+    return lang or default
+
+
+def _is_zh_lang(lang: str | None) -> bool:
+    return str(lang or "zh-CN").strip().lower().startswith("zh")
+
+
+def _strategy_ai_text(key: str, lang: str = "zh-CN") -> str:
+    is_zh = _is_zh_lang(lang)
+    texts = {
+        "prompt_empty": "提示词不能为空" if is_zh else "Prompt cannot be empty",
+        "no_llm_key": "未配置 LLM API Key" if is_zh else "No LLM API key configured",
+        "insufficient_credits": "积分不足，请充值后重试" if is_zh else "Insufficient credits. Please top up and try again.",
+        "invalid_json_params": "AI 未返回有效的 JSON 参数" if is_zh else "AI did not return valid JSON parameters",
+        "ai_empty_result": "AI 生成结果为空" if is_zh else "AI generation returned empty result",
+        "success": "success",
+    }
+    return texts.get(key, key)
+
+
+def _strategy_hint_to_text(hint_code: str, params: dict | None = None, lang: str = "zh-CN") -> str:
+    _ = params or {}
+    is_zh = _is_zh_lang(lang)
+    if hint_code == 'MISSING_ON_INIT':
+        return "缺少 on_init(ctx) 函数。" if is_zh else "Missing on_init(ctx) function."
+    if hint_code == 'MISSING_ON_BAR':
+        return "缺少 on_bar(ctx, bar) 函数。" if is_zh else "Missing on_bar(ctx, bar) function."
+    if hint_code == 'NO_CTX_PARAM_DEFAULTS':
+        return "没有通过 ctx.param(...) 声明参数默认值。" if is_zh else "No parameter defaults were declared via ctx.param(...)."
+    if hint_code == 'NO_ORDER_INTENT':
+        return "没有检测到 ctx.buy / ctx.sell / ctx.close_position 等交易动作。" if is_zh else "No order intent like ctx.buy / ctx.sell / ctx.close_position was detected."
+    if hint_code == 'EMPTY_CODE':
+        return "策略代码为空。" if is_zh else "Strategy code is empty."
+    return f"检测到策略提示：{hint_code}" if is_zh else f"Strategy hint detected: {hint_code}"
+
+
+def _strategy_human_summary(
+    initial_validation: dict,
+    final_validation: dict,
+    auto_fix_applied: bool,
+    auto_fix_succeeded: bool,
+    returned_candidate: str,
+    lang: str = "zh-CN",
+) -> dict:
+    is_zh = _is_zh_lang(lang)
+    initial_hints = initial_validation.get('hints') or []
+    final_hints = final_validation.get('hints') or []
+    initial_codes = {h.get('code') for h in initial_hints if h.get('code')}
+    final_codes = {h.get('code') for h in final_hints if h.get('code')}
+    fixed_codes = sorted(initial_codes - final_codes)
+    remaining_codes = sorted(final_codes)
+
+    fixed_messages = [
+        _strategy_hint_to_text(h.get('code'), h.get('params'), lang=lang)
+        for h in initial_hints
+        if h.get('code') in fixed_codes
+    ]
+    remaining_messages = [
+        _strategy_hint_to_text(h.get('code'), h.get('params'), lang=lang)
+        for h in final_hints
+        if h.get('code') in remaining_codes
+    ]
+
+    if auto_fix_applied and auto_fix_succeeded:
+        title = "AI 已自动修复并返回更稳定的策略代码" if is_zh else "AI auto-fixed the strategy code and returned a more stable version"
+    elif auto_fix_applied:
+        title = "AI 尝试自动修复策略代码，但仍保留部分问题" if is_zh else "AI attempted to auto-fix the strategy code, but some issues still remain"
+    else:
+        title = "AI 已生成策略代码，并通过当前质检流程" if is_zh else "AI generated strategy code and it passed the current QA flow"
+
+    returned_text = (
+        "当前返回的是自动修复后的代码。"
+        if returned_candidate == 'repaired' and is_zh else
+        "The returned code is the auto-fixed version."
+        if returned_candidate == 'repaired' else
+        "当前返回的是首次生成的代码。"
+        if is_zh else
+        "The returned code is the initially generated version."
+    )
+    return {
+        "title": title,
+        "returned_text": returned_text,
+        "fixed_messages": fixed_messages,
+        "remaining_messages": remaining_messages,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +372,13 @@ def run_strategy_backtest():
                 'msg': f'Backtest range exceeds limit: timeframe {timeframe} supports up to {max_range_text} ({max_days} days), but you selected {days_diff} days',
                 'data': None
             }), 400
+
+        logger.info(
+            f"[StrategyBacktestRequest] user={user_id} strategy={strategy_id} "
+            f"{snapshot.get('market') or ''}:{snapshot.get('symbol') or ''} "
+            f"tf={timeframe} range=[{start_date_str} ~ {end_date_str}] ({days_diff}d) "
+            f"run_type={snapshot.get('run_type') or ''}"
+        )
 
         svc = get_backtest_service()
         result = svc.run_strategy_snapshot(snapshot, start_date=start_date, end_date=end_date)
@@ -704,6 +896,66 @@ def get_positions():
         return jsonify({'code': 0, 'msg': str(e), 'data': {'positions': [], 'items': []}}), 500
 
 
+def _build_strategy_equity_curve(user_id: int, strategy_id: int):
+    st = get_strategy_service().get_strategy(strategy_id, user_id=user_id) or {}
+    if not st:
+        return None, 'Strategy not found'
+
+    initial = float(st.get('initial_capital') or (st.get('trading_config') or {}).get('initial_capital') or 0)
+    if initial <= 0:
+        initial = 1000.0
+
+    with get_db_connection() as db:
+        cur = db.cursor()
+        cur.execute(
+            """
+            SELECT created_at, profit
+            FROM qd_strategy_trades
+            WHERE strategy_id = ?
+            ORDER BY created_at ASC
+            """,
+            (strategy_id,)
+        )
+        rows = cur.fetchall() or []
+        cur.execute(
+            """
+            SELECT COALESCE(SUM(unrealized_pnl), 0) AS u
+            FROM qd_strategy_positions
+            WHERE strategy_id = ?
+            """,
+            (strategy_id,),
+        )
+        prow = cur.fetchone() or {}
+        cur.close()
+
+    equity = initial
+    curve = []
+    for r in rows:
+        try:
+            equity += float(r.get('profit') or 0)
+        except Exception:
+            pass
+        created_at = r.get('created_at')
+        if created_at and hasattr(created_at, 'timestamp'):
+            ts = int(created_at.timestamp())
+        elif created_at:
+            ts = int(created_at)
+        else:
+            ts = int(time.time())
+        curve.append({'time': ts, 'equity': round(equity, 2)})
+
+    try:
+        unreal = float(prow.get('u') or prow.get('U') or 0)
+    except Exception:
+        unreal = 0.0
+    live_equity = float(equity) + unreal
+    now_ts = int(time.time())
+    if abs(unreal) > 1e-12 or not curve:
+        curve.append({'time': now_ts, 'equity': round(live_equity, 2)})
+
+    return curve, None
+
+
 @strategy_bp.route('/strategies/equityCurve', methods=['GET'])
 @login_required
 def get_equity_curve():
@@ -714,61 +966,9 @@ def get_equity_curve():
         if not strategy_id:
             return jsonify({'code': 0, 'msg': 'Missing strategy id parameter', 'data': []}), 400
 
-        st = get_strategy_service().get_strategy(strategy_id, user_id=user_id) or {}
-        if not st:
-            return jsonify({'code': 0, 'msg': 'Strategy not found', 'data': []}), 404
-        initial = float(st.get('initial_capital') or (st.get('trading_config') or {}).get('initial_capital') or 0)
-        if initial <= 0:
-            initial = 1000.0
-
-        with get_db_connection() as db:
-            cur = db.cursor()
-            cur.execute(
-                """
-                SELECT created_at, profit
-                FROM qd_strategy_trades
-                WHERE strategy_id = ?
-                ORDER BY created_at ASC
-                """,
-                (strategy_id,)
-            )
-            rows = cur.fetchall() or []
-            cur.execute(
-                """
-                SELECT COALESCE(SUM(unrealized_pnl), 0) AS u
-                FROM qd_strategy_positions
-                WHERE strategy_id = ?
-                """,
-                (strategy_id,),
-            )
-            prow = cur.fetchone() or {}
-            cur.close()
-
-        equity = initial
-        curve = []
-        for r in rows:
-            try:
-                equity += float(r.get('profit') or 0)
-            except Exception:
-                pass
-            created_at = r.get('created_at')
-            if created_at and hasattr(created_at, 'timestamp'):
-                ts = int(created_at.timestamp())
-            elif created_at:
-                ts = int(created_at)
-            else:
-                ts = int(time.time())
-            curve.append({'time': ts, 'equity': round(equity, 2)})
-
-        # 将未实现盈亏并入曲线末端，便于「持仓中」也能在绩效里看到浮动权益
-        try:
-            unreal = float(prow.get('u') or prow.get('U') or 0)
-        except Exception:
-            unreal = 0.0
-        live_equity = float(equity) + unreal
-        now_ts = int(time.time())
-        if abs(unreal) > 1e-12 or not curve:
-            curve.append({'time': now_ts, 'equity': round(live_equity, 2)})
+        curve, error = _build_strategy_equity_curve(user_id, strategy_id)
+        if error:
+            return jsonify({'code': 0, 'msg': error, 'data': []}), 404
 
         return jsonify({'code': 1, 'msg': 'success', 'data': curve})
     except Exception as e:
@@ -1306,25 +1506,8 @@ def verify_strategy_code():
         if not code.strip():
             return jsonify({'success': False, 'message': 'Code is empty'})
 
-        required_funcs = ['on_bar', 'on_init']
-        found = [f for f in required_funcs if f'def {f}' in code]
-        missing = [f for f in required_funcs if f not in found]
-
-        if missing:
-            return jsonify({
-                'success': False,
-                'message': f'Missing required functions: {", ".join(missing)}'
-            })
-
-        try:
-            compile(code, '<strategy>', 'exec')
-        except SyntaxError as se:
-            return jsonify({
-                'success': False,
-                'message': f'Syntax error at line {se.lineno}: {se.msg}'
-            })
-
-        return jsonify({'success': True, 'message': 'Code verification passed'})
+        validation = _validate_strategy_code_internal(code)
+        return jsonify(validation)
     except Exception as e:
         logger.error(f"verify_strategy_code failed: {str(e)}")
         return jsonify({'success': False, 'message': str(e)})
@@ -1336,16 +1519,29 @@ def ai_generate_strategy():
     """Generate strategy code or suggest template parameter updates using AI."""
     try:
         payload = request.get_json() or {}
+        lang = _request_lang()
         prompt = payload.get('prompt', '')
         if not prompt.strip():
-            return jsonify({'code': '', 'msg': 'Prompt is empty', 'params': None})
+            return jsonify({'code': '', 'msg': _strategy_ai_text('prompt_empty', lang), 'params': None})
 
         intent = (payload.get('intent') or 'generate_code').strip()
         from app.services.llm import LLMService
         llm = LLMService()
         api_key = llm.get_api_key()
         if not api_key:
-            return jsonify({'code': '', 'msg': 'No LLM API key configured', 'params': None})
+            return jsonify({'code': '', 'msg': _strategy_ai_text('no_llm_key', lang), 'params': None})
+
+        from app.services.billing_service import get_billing_service
+        billing = get_billing_service()
+        user_id = g.user_id
+        ok, billing_msg = billing.check_and_consume(
+            user_id=user_id,
+            feature='ai_code_gen',
+            reference_id=f"ai_strategy_{intent}_{user_id}_{int(time.time())}"
+        )
+        if not ok:
+            msg = f'积分不足: {billing_msg}' if _is_zh_lang(lang) and billing_msg else _strategy_ai_text('insufficient_credits', lang)
+            return jsonify({'code': '', 'msg': msg, 'params': None})
 
         if intent == 'bot_recommend':
             # ── Extract symbol from user prompt and fetch real market data ──
@@ -1425,10 +1621,10 @@ def ai_generate_strategy():
                 "You are an expert quantitative trading advisor. The user wants to create an automated trading bot.\n"
                 "Based on their description AND the real-time market data provided, recommend one of the four bot types and provide optimal parameters.\n\n"
                 "Available bot types and their parameter schemas:\n"
-                "1. grid - Grid Trading: {upperPrice: number, lowerPrice: number, gridCount: int(5-100), amountPerGrid: number, gridMode: 'arithmetic'|'geometric'}\n"
-                "2. martingale - Martingale: {initialAmount: number, multiplier: number(1.1-3.0), maxLayers: int(2-10), priceDropPct: number(1-20), takeProfitPct: number(1-50)}\n"
+                "1. grid - Grid Trading: {upperPrice: number, lowerPrice: number, gridCount: int(5-100), gridMode: 'arithmetic'|'geometric'}\n"
+                "2. martingale - Martingale: {multiplier: number(1.1-3.0), maxLayers: int(2-10), priceDropPct: number(1-20)}\n"
                 "3. trend - Trend Following: {maPeriod: int(5-200), maType: 'SMA'|'EMA', confirmBars: int(1-5), positionPct: number(10-100), direction: 'long'|'short'|'both'}\n"
-                "4. dca - DCA (Dollar-Cost Averaging): {amountEach: number, frequency: 'every_bar'|'4h'|'daily'|'weekly', totalBudget: number, dipBuyEnabled: bool, dipThreshold: number(1-30)}\n\n"
+                "4. dca - DCA (Dollar-Cost Averaging): {amountEach: number, frequency: 'every_bar'|'hourly'|'4h'|'daily'|'weekly'|'biweekly'|'monthly', dipBuyEnabled: bool, dipThreshold: number(1-30)}\n\n"
                 "Also suggest base config:\n"
                 "- symbol: string (e.g. 'BTC/USDT')\n"
                 "- timeframe: '1m'|'5m'|'15m'|'1h'|'4h'|'1d'\n"
@@ -1442,6 +1638,7 @@ def ai_generate_strategy():
                 "CRITICAL: If real-time market data is provided, you MUST use it to set realistic and accurate parameters.\n"
                 "For example, for grid trading, the upperPrice and lowerPrice MUST be derived from the actual price range in the market data.\n"
                 "IMPORTANT: Do NOT set initialCapital in baseConfig - leave it as 0 or omit it. The user will enter their own investment amount.\n"
+                "IMPORTANT: Keep strategyParams focused on bot logic only. Put stopLossPct/takeProfitPct only in riskConfig, not in strategyParams.\n"
                 "Also do NOT set amountPerGrid, initialAmount(for martingale), or totalBudget(for DCA) - these will be auto-calculated from the user's capital.\n\n"
                 "Return ONLY a single JSON object with this structure:\n"
                 "{\n"
@@ -1488,6 +1685,30 @@ def ai_generate_strategy():
             valid_types = ('grid', 'martingale', 'trend', 'dca')
             if result.get('botType') not in valid_types:
                 result['botType'] = 'grid'
+            params = result.get('strategyParams') if isinstance(result.get('strategyParams'), dict) else {}
+            risk_cfg = result.get('riskConfig') if isinstance(result.get('riskConfig'), dict) else {}
+            base_cfg = result.get('baseConfig') if isinstance(result.get('baseConfig'), dict) else {}
+
+            # These amounts are derived from user capital in the product UI; keep the AI
+            # recommendation focused on strategy logic to avoid duplicate/conflicting fields.
+            if 'initialCapital' in base_cfg:
+                base_cfg['initialCapital'] = 0
+            result['baseConfig'] = base_cfg
+
+            bot_type = result.get('botType')
+            if bot_type == 'grid':
+                params.pop('amountPerGrid', None)
+            elif bot_type == 'martingale':
+                params.pop('initialAmount', None)
+                params.pop('takeProfitPct', None)
+            elif bot_type == 'dca':
+                params.pop('totalBudget', None)
+                freq = str(params.get('frequency') or '').strip().lower()
+                allowed = {'every_bar', 'hourly', '4h', 'daily', 'weekly', 'biweekly', 'monthly'}
+                if freq and freq not in allowed:
+                    params['frequency'] = 'daily'
+            result['strategyParams'] = params
+            result['riskConfig'] = risk_cfg
             return jsonify({'code': '', 'params': None, 'bot_recommend': result, 'msg': 'success'})
 
         if intent == 'adjust_params':
@@ -1533,8 +1754,8 @@ Do not use markdown fences, do not add explanations before or after the JSON."""
                     except json.JSONDecodeError:
                         updates = None
             if not isinstance(updates, dict):
-                return jsonify({'code': '', 'params': None, 'msg': 'AI did not return valid JSON parameters'})
-            return jsonify({'code': '', 'params': updates, 'msg': 'success'})
+                return jsonify({'code': '', 'params': None, 'msg': _strategy_ai_text('invalid_json_params', lang)})
+            return jsonify({'code': '', 'params': updates, 'msg': _strategy_ai_text('success', lang)})
 
         system_prompt = """You are a quantitative trading strategy code generator.
 Generate Python strategy code that follows this framework:
@@ -1550,7 +1771,15 @@ Generate Python strategy code that follows this framework:
 - def on_order_filled(ctx, order): Optional callback when order fills
 - def on_stop(ctx): Optional cleanup when strategy stops
 
-Return ONLY the Python code, no explanations."""
+Return ONLY the Python code, no explanations.
+
+Quality rules:
+- Always define both on_init(ctx) and on_bar(ctx, bar)
+- Prefer reading defaults via ctx.param(...)
+- Use ctx.buy / ctx.sell / ctx.close_position for order intent
+- Generated code must compile cleanly
+- Avoid markdown fences or explanatory text
+"""
 
         extra = ''
         template_key = payload.get('template_key')
@@ -1587,13 +1816,122 @@ Return ONLY the Python code, no explanations."""
             content = content[:-3]
         content = content.strip()
 
-        if content:
-            return jsonify({'code': content, 'msg': 'success', 'params': None})
+        AUTO_FIX_HINT_CODES = {
+            'MISSING_ON_INIT',
+            'MISSING_ON_BAR',
+        }
+
+        def _needs_auto_fix_strategy(validation: dict) -> bool:
+            if not validation.get('success'):
+                return True
+            return any(h.get('code') in AUTO_FIX_HINT_CODES for h in (validation.get('hints') or []))
+
+        def _format_strategy_validation_issues(validation: dict) -> str:
+            issues = []
+            if not validation.get('success'):
+                issues.append(f"- Verification failed: {validation.get('message')}")
+                if validation.get('details'):
+                    issues.append(f"- Details: {validation.get('details')}")
+            for hint in validation.get('hints') or []:
+                code_name = hint.get('code') or 'UNKNOWN'
+                params_obj = hint.get('params') or {}
+                if params_obj:
+                    issues.append(f"- Hint {code_name}: {json.dumps(params_obj, ensure_ascii=False)}")
+                else:
+                    issues.append(f"- Hint {code_name}")
+            return "\n".join(issues) if issues else "- No issues provided"
+
+        def _repair_strategy_code_via_llm(bad_code: str, validation: dict) -> str:
+            repair_prompt = (
+                "You produced QuantDinger strategy script code that failed automatic validation. "
+                "Fix the code while preserving the user's trading idea. Return one full replacement script only.\n\n"
+                f"# Original user request\n{prompt.strip()}\n\n"
+                f"# Validation issues to fix\n{_format_strategy_validation_issues(validation)}\n\n"
+                "# Current code\n```python\n"
+                + bad_code.strip()
+                + "\n```\n\n"
+                "# Repair requirements\n"
+                "- Must define both on_init(ctx) and on_bar(ctx, bar).\n"
+                "- Must compile and run in QuantDinger strategy runtime.\n"
+                "- Prefer ctx.param(...) for defaults.\n"
+                "- Use ctx.buy / ctx.sell / ctx.close_position for actions.\n"
+                "- Return Python only, no markdown, no explanation."
+            )
+            repaired_content = llm.call_llm_api(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": repair_prompt},
+                ],
+                model=llm.get_code_generation_model(),
+                temperature=0.2,
+                use_json_mode=False
+            )
+            repaired_content = (repaired_content or '').strip()
+            if repaired_content.startswith("```python"):
+                repaired_content = repaired_content[9:]
+            elif repaired_content.startswith("```"):
+                repaired_content = repaired_content[3:]
+            if repaired_content.endswith("```"):
+                repaired_content = repaired_content[:-3]
+            return repaired_content.strip() or bad_code
+
+        validation = _validate_strategy_code_internal(content)
+        debug = {
+            'auto_fix_applied': False,
+            'auto_fix_succeeded': False,
+            'returned_candidate': 'initial',
+            'initial_validation': _strategy_debug_summary(validation),
+            'final_validation': _strategy_debug_summary(validation),
+        }
+        debug['human_summary'] = _strategy_human_summary(validation, validation, False, False, 'initial', lang=lang)
+
+        if _needs_auto_fix_strategy(validation):
+            logger.warning("ai_generate_strategy produced code needing auto-fix: %s", _format_strategy_validation_issues(validation))
+            try:
+                repaired = _repair_strategy_code_via_llm(content, validation)
+                repaired_validation = _validate_strategy_code_internal(repaired)
+                debug = {
+                    'auto_fix_applied': True,
+                    'auto_fix_succeeded': repaired_validation.get('success', False),
+                    'returned_candidate': 'repaired' if repaired_validation.get('success') else 'initial',
+                    'initial_validation': _strategy_debug_summary(validation),
+                    'final_validation': _strategy_debug_summary(repaired_validation),
+                }
+                debug['human_summary'] = _strategy_human_summary(
+                    validation,
+                    repaired_validation,
+                    True,
+                    repaired_validation.get('success', False),
+                    'repaired' if repaired_validation.get('success') else 'initial',
+                    lang=lang
+                )
+                logger.info("ai_generate_strategy debug=%s", json.dumps(debug, ensure_ascii=False))
+                if repaired_validation.get('success'):
+                    content = repaired
+                else:
+                    logger.warning("ai_generate_strategy auto-fix failed, keeping initial candidate")
+            except Exception as repair_err:
+                debug = {
+                    'auto_fix_applied': True,
+                    'auto_fix_succeeded': False,
+                    'returned_candidate': 'initial',
+                    'initial_validation': _strategy_debug_summary(validation),
+                    'final_validation': _strategy_debug_summary(validation),
+                    'auto_fix_error': str(repair_err),
+                }
+                debug['human_summary'] = _strategy_human_summary(validation, validation, True, False, 'initial', lang=lang)
+                logger.error("ai_generate_strategy auto-fix failed: %s", repair_err)
         else:
-            return jsonify({'code': '', 'msg': 'AI generation returned empty result', 'params': None})
+            debug['human_summary'] = _strategy_human_summary(validation, validation, False, False, 'initial', lang=lang)
+            logger.info("ai_generate_strategy debug=%s", json.dumps(debug, ensure_ascii=False))
+
+        if content:
+            return jsonify({'code': content, 'msg': _strategy_ai_text('success', lang), 'params': None, 'debug': debug})
+        else:
+            return jsonify({'code': '', 'msg': _strategy_ai_text('ai_empty_result', lang), 'params': None, 'debug': debug})
     except Exception as e:
         logger.error(f"ai_generate_strategy failed: {str(e)}")
-        return jsonify({'code': '', 'msg': str(e), 'params': None})
+        return jsonify({'code': '', 'msg': str(e), 'params': None, 'debug': None})
 
 
 @strategy_bp.route('/strategies/performance', methods=['GET'])
@@ -1601,17 +1939,26 @@ Return ONLY the Python code, no explanations."""
 def get_strategy_performance():
     """Get strategy performance metrics (aggregated from equity curve and trades)."""
     try:
-        strategy_id = request.args.get('id')
+        user_id = g.user_id
+        strategy_id = request.args.get('id', type=int)
         if not strategy_id:
             return jsonify({'code': 0, 'msg': 'Strategy ID required'})
 
-        svc = get_strategy_service()
-        equity_data = svc.get_equity_curve(int(strategy_id))
+        equity_data, error = _build_strategy_equity_curve(user_id, strategy_id)
+        if error:
+            return jsonify({'code': 0, 'msg': error, 'data': None}), 404
+
+        latest_equity = float(equity_data[-1].get('equity') or 0) if equity_data else 0.0
+        first_equity = float(equity_data[0].get('equity') or 0) if equity_data else latest_equity
+        total_return = latest_equity - first_equity
         return jsonify({
             'code': 1,
             'msg': 'success',
             'data': {
-                'equity_curve': equity_data
+                'equity_curve': equity_data,
+                'latest_equity': round(latest_equity, 2),
+                'total_return': round(total_return, 2),
+                'points': len(equity_data),
             }
         })
     except Exception as e:
@@ -1659,7 +2006,10 @@ def get_strategy_logs():
                 continue
             ts = rr.get('timestamp')
             if ts is not None and hasattr(ts, 'isoformat'):
-                rr['timestamp'] = ts.isoformat()
+                if getattr(ts, 'tzinfo', None) is not None:
+                    rr['timestamp'] = ts.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S') + 'Z'
+                else:
+                    rr['timestamp'] = ts.strftime('%Y-%m-%dT%H:%M:%S') + 'Z'
             out.append(rr)
         logs = list(reversed(out))
         return jsonify({'code': 1, 'msg': 'success', 'data': logs})

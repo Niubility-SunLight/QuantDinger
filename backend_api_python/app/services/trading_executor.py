@@ -499,19 +499,39 @@ class TradingExecutor:
             pass
         return 0.06
 
-    def _hydrate_script_ctx_from_positions(self, ctx: StrategyScriptContext, strategy_id: int, symbol: str) -> None:
+    def _hydrate_script_ctx_from_positions(
+        self,
+        ctx: StrategyScriptContext,
+        strategy_id: int,
+        symbol: str,
+        initial_capital: Optional[float] = None,
+        current_price: Optional[float] = None,
+    ) -> None:
         ctx.position.clear_position()
         pl = self._get_current_positions(strategy_id, symbol)
-        if not pl:
-            return
-        p = pl[0]
-        side = (p.get('side') or 'long').strip().lower()
-        if side not in ('long', 'short'):
-            return
-        size = float(p.get('size') or 0)
-        ep = float(p.get('entry_price') or 0)
-        if size > 0:
-            ctx.position.open_position(side, ep, size)
+        if pl:
+            p = pl[0]
+            side = (p.get('side') or 'long').strip().lower()
+            if side in ('long', 'short'):
+                size = float(p.get('size') or 0)
+                ep = float(p.get('entry_price') or 0)
+                if size > 0:
+                    ctx.position.open_position(side, ep, size)
+        # 把 ctx.balance 刷新为最新权益(初始资金 + 已实现盈亏 + 未实现盈亏),
+        # 这样趋势等使用 ctx.balance * POS_PCT 计算仓位的脚本能反映真实资金
+        try:
+            if initial_capital is not None and float(initial_capital) > 0:
+                eq = self._calculate_current_equity(
+                    strategy_id,
+                    float(initial_capital),
+                    current_positions=pl,
+                    current_price=current_price,
+                    symbol=symbol,
+                )
+                ctx.balance = float(eq)
+                ctx.equity = float(eq)
+        except Exception:
+            pass
 
     def _init_script_strategy_context(
         self,
@@ -599,6 +619,31 @@ class TradingExecutor:
 
         out: List[Dict[str, Any]] = []
         trig = float(bar_close or 0)
+        # 把 bot 脚本传来的 USDT 名义金额换算成本 tick 的近似 qty,用于维护
+        # 本地 ctx.position 在同一 bar/tick 内多个 order 之间的一致性(只影响
+        # 脚本对 ctx.position 的符号/数量判断,真实下单数量仍由
+        # _execute_signal 按 leverage/market_type 计算)
+        try:
+            is_bot_script = bool(
+                (trading_config or {}).get('bot_type')
+                or (trading_config or {}).get('strategy_mode') == 'bot'
+            )
+        except Exception:
+            is_bot_script = False
+        try:
+            leverage = float((trading_config or {}).get('leverage') or 1) or 1.0
+        except Exception:
+            leverage = 1.0
+        market_type = str((trading_config or {}).get('market_type') or 'swap').lower()
+
+        def _to_local_qty(usdt_or_ratio: float, ref_price: float) -> float:
+            if ref_price is None or ref_price <= 0 or usdt_or_ratio is None or usdt_or_ratio <= 0:
+                return 0.0
+            if is_bot_script and float(usdt_or_ratio) > 1.0:
+                lev = leverage if market_type != 'spot' else 1.0
+                return float(usdt_or_ratio) * lev / float(ref_price)
+            return float(usdt_or_ratio)
+
         for order in list(ctx._orders or []):
             action = str(order.get('action') or '').lower()
             try:
@@ -614,57 +659,61 @@ class TradingExecutor:
                         pos_ratio = v
                 except Exception:
                     pass
+            ref_px = order_price if order_price > 0 else trig
+            local_qty = _to_local_qty(pos_ratio, ref_px)
             if action == 'close':
                 if ctx.position > 0:
-                    out.append({'type': 'close_long', 'trigger_price': order_price or trig, 'position_size': 0, 'timestamp': ts_i})
+                    out.append({'type': 'close_long', 'trigger_price': ref_px, 'position_size': 0, 'timestamp': ts_i})
                     ctx.position.clear_position()
                 elif ctx.position < 0:
-                    out.append({'type': 'close_short', 'trigger_price': order_price or trig, 'position_size': 0, 'timestamp': ts_i})
+                    out.append({'type': 'close_short', 'trigger_price': ref_px, 'position_size': 0, 'timestamp': ts_i})
                     ctx.position.clear_position()
                 continue
             if action == 'buy':
                 if is_grid_bot:
                     if ctx.position < 0:
-                        out.append({'type': 'close_short', 'trigger_price': order_price or trig, 'position_size': pos_ratio, 'timestamp': ts_i})
+                        out.append({'type': 'close_short', 'trigger_price': ref_px, 'position_size': pos_ratio, 'timestamp': ts_i})
+                        ctx.position.reduce_position(local_qty)
                     elif ctx.position == 0:
-                        out.append({'type': 'open_long', 'trigger_price': order_price or trig, 'position_size': pos_ratio, 'timestamp': ts_i})
-                        ctx.position.open_position('long', order_price or trig, pos_ratio)
+                        out.append({'type': 'open_long', 'trigger_price': ref_px, 'position_size': pos_ratio, 'timestamp': ts_i})
+                        ctx.position.open_position('long', ref_px, local_qty)
                     else:
-                        out.append({'type': 'add_long', 'trigger_price': order_price or trig, 'position_size': pos_ratio, 'timestamp': ts_i})
-                        ctx.position.add_position(order_price or trig, pos_ratio)
+                        out.append({'type': 'add_long', 'trigger_price': ref_px, 'position_size': pos_ratio, 'timestamp': ts_i})
+                        ctx.position.add_position(ref_px, local_qty)
                 else:
                     if ctx.position < 0:
-                        out.append({'type': 'close_short', 'trigger_price': order_price or trig, 'position_size': 0, 'timestamp': ts_i})
+                        out.append({'type': 'close_short', 'trigger_price': ref_px, 'position_size': 0, 'timestamp': ts_i})
                         ctx.position.clear_position()
                     if td in ('long', 'both'):
                         if ctx.position == 0:
-                            out.append({'type': 'open_long', 'trigger_price': order_price or trig, 'position_size': pos_ratio, 'timestamp': ts_i})
-                            ctx.position.open_position('long', order_price or trig, pos_ratio)
+                            out.append({'type': 'open_long', 'trigger_price': ref_px, 'position_size': pos_ratio, 'timestamp': ts_i})
+                            ctx.position.open_position('long', ref_px, local_qty)
                         else:
-                            out.append({'type': 'add_long', 'trigger_price': order_price or trig, 'position_size': pos_ratio, 'timestamp': ts_i})
-                            ctx.position.add_position(order_price or trig, pos_ratio)
+                            out.append({'type': 'add_long', 'trigger_price': ref_px, 'position_size': pos_ratio, 'timestamp': ts_i})
+                            ctx.position.add_position(ref_px, local_qty)
                 continue
             if action == 'sell':
                 if is_grid_bot:
                     if ctx.position > 0:
-                        out.append({'type': 'close_long', 'trigger_price': order_price or trig, 'position_size': pos_ratio, 'timestamp': ts_i})
+                        out.append({'type': 'close_long', 'trigger_price': ref_px, 'position_size': pos_ratio, 'timestamp': ts_i})
+                        ctx.position.reduce_position(local_qty)
                     elif ctx.position == 0:
-                        out.append({'type': 'open_short', 'trigger_price': order_price or trig, 'position_size': pos_ratio, 'timestamp': ts_i})
-                        ctx.position.open_position('short', order_price or trig, pos_ratio)
+                        out.append({'type': 'open_short', 'trigger_price': ref_px, 'position_size': pos_ratio, 'timestamp': ts_i})
+                        ctx.position.open_position('short', ref_px, local_qty)
                     else:
-                        out.append({'type': 'add_short', 'trigger_price': order_price or trig, 'position_size': pos_ratio, 'timestamp': ts_i})
-                        ctx.position.add_position(order_price or trig, pos_ratio)
+                        out.append({'type': 'add_short', 'trigger_price': ref_px, 'position_size': pos_ratio, 'timestamp': ts_i})
+                        ctx.position.add_position(ref_px, local_qty)
                 else:
                     if ctx.position > 0:
-                        out.append({'type': 'close_long', 'trigger_price': order_price or trig, 'position_size': 0, 'timestamp': ts_i})
+                        out.append({'type': 'close_long', 'trigger_price': ref_px, 'position_size': 0, 'timestamp': ts_i})
                         ctx.position.clear_position()
                     if td in ('short', 'both'):
                         if ctx.position == 0:
-                            out.append({'type': 'open_short', 'trigger_price': order_price or trig, 'position_size': pos_ratio, 'timestamp': ts_i})
-                            ctx.position.open_position('short', order_price or trig, pos_ratio)
+                            out.append({'type': 'open_short', 'trigger_price': ref_px, 'position_size': pos_ratio, 'timestamp': ts_i})
+                            ctx.position.open_position('short', ref_px, local_qty)
                         else:
-                            out.append({'type': 'add_short', 'trigger_price': order_price or trig, 'position_size': pos_ratio, 'timestamp': ts_i})
-                            ctx.position.add_position(order_price or trig, pos_ratio)
+                            out.append({'type': 'add_short', 'trigger_price': ref_px, 'position_size': pos_ratio, 'timestamp': ts_i})
+                            ctx.position.add_position(ref_px, local_qty)
         return out
 
     def _script_evaluate_new_closed_bar(
@@ -691,7 +740,17 @@ class TradingExecutor:
         pos = len(df) - 2
         ctx.current_index = int(pos)
         row = df_exec.iloc[pos]
-        self._hydrate_script_ctx_from_positions(ctx, strategy_id, symbol)
+        _init_cap = (trading_config or {}).get('initial_capital')
+        _bar_close_for_hydrate = None
+        try:
+            _bar_close_for_hydrate = float(row.get('close') or 0)
+        except Exception:
+            _bar_close_for_hydrate = None
+        self._hydrate_script_ctx_from_positions(
+            ctx, strategy_id, symbol,
+            initial_capital=_init_cap,
+            current_price=_bar_close_for_hydrate,
+        )
         ctx._orders = []
         bar = ScriptBar(
             open=float(row.get('open') or 0),
@@ -760,21 +819,14 @@ class TradingExecutor:
                 logger.warning(f"Strategy {strategy_id} invalid leverage format, reset to 1: {trading_config.get('leverage')}")
                 leverage = 1.0
             
-            # 获取市场类型，默认为合约
-            # 根据杠杆自动判断：杠杆=1为现货，杠杆>1为合约
+            # 获取市场类型，严格以策略配置为准，不再通过杠杆反推。
             market_type = trading_config.get('market_type', 'swap')
             if market_type not in ['swap', 'spot']:
                 logger.error(f"Strategy {strategy_id} invalid market_type={market_type} (only swap/spot supported); refusing to start")
                 return
-            
-            # 根据杠杆自动调整市场类型
-            if leverage == 1.0:
-                market_type = 'spot'  # 现货固定1倍杠杆
-                logger.info(f"Strategy {strategy_id} leverage=1; auto-switch market_type to spot")
-            else:
-                # 合约市场：统一使用 swap（永续），避免 futures/delivery 混淆导致持仓/下单查错市场
-                market_type = 'swap'
-                logger.info(f"Strategy {strategy_id} derivatives trading; normalize market_type to: {market_type}")
+            if market_type == 'swap':
+                # 合约市场统一使用 swap（永续），避免 futures/delivery 混淆导致持仓/下单查错市场
+                logger.info(f"Strategy {strategy_id} derivatives trading; normalize market_type to: swap")
             
             # 根据市场类型限制杠杆
             if market_type == 'spot':
@@ -945,7 +997,11 @@ class TradingExecutor:
                     strategy_id, df, trading_config, initial_capital
                 )
                 if on_init_script:
-                    self._hydrate_script_ctx_from_positions(script_ctx, strategy_id, symbol)
+                    self._hydrate_script_ctx_from_positions(
+                        script_ctx, strategy_id, symbol,
+                        initial_capital=initial_capital,
+                        current_price=(float(df['close'].iloc[-1]) if df is not None and len(df) > 0 else None),
+                    )
                     try:
                         on_init_script(script_ctx)
                     except Exception as e:
@@ -1101,7 +1157,11 @@ class TradingExecutor:
                         # 3a. Bot-mode scripts: evaluate on every tick (grid/martingale need real-time price tracking)
                         if is_script and is_bot_mode and on_bar_script and script_ctx is not None:
                             try:
-                                self._hydrate_script_ctx_from_positions(script_ctx, strategy_id, symbol)
+                                self._hydrate_script_ctx_from_positions(
+                                    script_ctx, strategy_id, symbol,
+                                    initial_capital=initial_capital,
+                                    current_price=float(current_price),
+                                )
                                 script_ctx._orders = []
                                 tick_bar = ScriptBar(
                                     open=float(current_price),
@@ -1205,6 +1265,11 @@ class TradingExecutor:
                         # 检查价格是否触发
                         triggered = False
 
+                        # Bot-mode scripts (grid / DCA / martingale) handle their own
+                        # timing inside on_bar; execute signals immediately.
+                        if is_bot_mode:
+                            triggered = True
+
                         # 【关键修复】平仓/止损止盈信号默认“立即触发”
                         exit_trigger_mode = trading_config.get('exit_trigger_mode', 'immediate')  # 'immediate' or 'price'
                         if signal_type in ['close_long', 'close_short'] and exit_trigger_mode == 'immediate':
@@ -1272,8 +1337,13 @@ class TradingExecutor:
                         # Strict state machine + priority:
                         # - Only allow signals matching current state (flat/long/short).
                         # - Always prefer close_* over open_*/add_*.
-                        # - Execute at most ONE signal per tick to avoid duplicated/re-entrant orders.
-                        candidates = [s for s in triggered_signals if self._is_signal_allowed(state, s.get('type'))]
+                        # - Bot-mode may need multiple state transitions in one tick
+                        #   (e.g. grid partial take-profit / reverse across levels),
+                        #   while indicator mode still executes at most one signal.
+                        if is_bot_mode:
+                            candidates = list(triggered_signals)
+                        else:
+                            candidates = [s for s in triggered_signals if self._is_signal_allowed(state, s.get('type'))]
 
                         # If both directions are present while flat, choose by trade_direction (deterministic).
                         if state == "flat" and candidates:
@@ -1292,12 +1362,12 @@ class TradingExecutor:
                             ),
                         )
 
-                        selected = None
                         now_i = int(time.time())
+                        execution_batch: List[Dict[str, Any]] = []
                         for s in candidates:
                             stype = s.get("type")
                             sts = int(s.get("timestamp") or 0)
-                            if self._should_skip_signal_once_per_candle(
+                            if (not is_bot_mode) and self._should_skip_signal_once_per_candle(
                                 strategy_id=strategy_id,
                                 symbol=symbol,
                                 signal_type=str(stype or ""),
@@ -1306,15 +1376,20 @@ class TradingExecutor:
                                 now_ts=now_i,
                             ):
                                 continue
-                            selected = s
-                            break
+                            execution_batch.append(s)
+                            if not is_bot_mode:
+                                break
 
-                        if selected:
+                        for selected in execution_batch:
                             signal_type = selected.get('type')
                             position_size = selected.get('position_size', 0)
                             trigger_price = selected.get('trigger_price', current_price)
                             execute_price = trigger_price if trigger_price > 0 else current_price
                             signal_ts = int(selected.get("timestamp") or 0)
+                            current_positions = self._get_current_positions(strategy_id, symbol)
+
+                            if not self._is_signal_allowed(self._position_state(current_positions), signal_type):
+                                continue
 
                             ok = self._execute_signal(
                                 strategy_id=strategy_id,
@@ -1335,13 +1410,17 @@ class TradingExecutor:
                                 notification_config=notification_config,
                                 trading_config=trading_config,
                                 ai_model_config=ai_model_config,
+                                stop_loss_price=selected.get("stop_loss_price"),
+                                take_profit_price=selected.get("take_profit_price"),
+                                signal_reason=selected.get("reason"),
+                                trailing_stop_price=selected.get("trailing_stop_price"),
                             )
                             if ok:
                                 logger.info(f"Strategy {strategy_id} signal executed: {signal_type} @ {execute_price}")
                                 append_strategy_log(
                                     strategy_id,
                                     "signal",
-                                    f"Signal submitted: {signal_type} @ {float(execute_price or 0):.6f}",
+                                    f"Signal submitted: {signal_type} @ {float(execute_price or 0):.6f}{self._signal_reason_log_suffix(selected)}",
                                 )
                                 # Notify portfolio positions linked to this symbol
                                 try:
@@ -1418,7 +1497,7 @@ class TradingExecutor:
                         initial_capital, leverage, decide_interval,
                         execution_mode, notification_config,
                         indicator_config, exchange_config, trading_config, ai_model_config,
-                        market_category, strategy_code
+                        market_category, strategy_mode, strategy_code
                     FROM qd_strategies_trading
                     WHERE id = %s
                 """
@@ -1627,8 +1706,7 @@ class TradingExecutor:
             if trading_config is None:
                 return None
 
-            enabled = trading_config.get('enable_server_side_stop_loss', True)
-            if str(enabled).lower() in ['0', 'false', 'no', 'off']:
+            if not self._is_server_side_exit_enabled(trading_config, 'enable_server_side_stop_loss'):
                 return None
 
             # 获取当前持仓（使用本地数据库记录作为风控依据）
@@ -1721,6 +1799,9 @@ class TradingExecutor:
         """
         try:
             if not trading_config:
+                return None
+
+            if not self._is_server_side_exit_enabled(trading_config, 'enable_server_side_take_profit'):
                 return None
 
             current_positions = self._get_current_positions(strategy_id, symbol)
@@ -1854,6 +1935,36 @@ class TradingExecutor:
             return None
         except Exception:
             return None
+
+    def _is_server_side_exit_enabled(self, trading_config: Optional[Dict[str, Any]], config_key: str) -> bool:
+        """
+        Determine if a server-side exit (SL/TP) should be active.
+
+        For non-bot strategies: enabled by default (historical behavior).
+        For bot strategies: enabled only when the corresponding pct value > 0,
+        since the user explicitly configured it in the risk form.
+        Martingale TP is handled in-script (take_profit_pct should be 0).
+        """
+        tc = trading_config if isinstance(trading_config, dict) else {}
+        bot_type = str(tc.get('bot_type') or '').strip().lower()
+
+        if config_key in tc:
+            v = tc[config_key]
+            if isinstance(v, str):
+                return v.strip().lower() not in ['0', 'false', 'no', 'off']
+            return bool(v)
+
+        if not bot_type:
+            return True
+
+        if config_key == 'enable_server_side_stop_loss':
+            pct = float(tc.get('stop_loss_pct') or 0)
+            return pct > 0
+        if config_key == 'enable_server_side_take_profit':
+            pct = float(tc.get('take_profit_pct') or 0)
+            return pct > 0
+
+        return False
     
     def _klines_to_dataframe(self, klines: List[Dict[str, Any]]) -> pd.DataFrame:
         """将K线数据转换为DataFrame"""
@@ -2360,6 +2471,8 @@ class TradingExecutor:
         margin_mode: str = 'cross',
         stop_loss_price: float = None,
         take_profit_price: float = None,
+        signal_reason: str = "",
+        trailing_stop_price: float = None,
         execution_mode: str = 'signal',
         notification_config: Optional[Dict[str, Any]] = None,
         trading_config: Optional[Dict[str, Any]] = None,
@@ -2422,6 +2535,30 @@ class TradingExecutor:
                     )
                     return False
 
+            # 1.2 Max position limit (risk control)
+            if sig in ("open_long", "open_short", "add_long", "add_short"):
+                max_pos = float((trading_config or {}).get('max_position') or 0)
+                if max_pos > 0:
+                    cur_pos_value = self._current_position_value(current_positions, current_price)
+                    if cur_pos_value >= max_pos:
+                        append_strategy_log(
+                            strategy_id, "info",
+                            f"Risk: max_position reached ({cur_pos_value:.2f} >= {max_pos:.2f}), blocking {sig}",
+                        )
+                        return False
+
+            # 1.3 Max daily loss limit (risk control)
+            if sig in ("open_long", "open_short", "add_long", "add_short"):
+                max_daily = float((trading_config or {}).get('max_daily_loss') or 0)
+                if max_daily > 0:
+                    daily_pnl = self._get_daily_pnl(strategy_id)
+                    if daily_pnl < 0 and abs(daily_pnl) >= max_daily:
+                        append_strategy_log(
+                            strategy_id, "info",
+                            f"Risk: max_daily_loss reached (loss={abs(daily_pnl):.2f} >= {max_daily:.2f}), blocking {sig}",
+                        )
+                        return False
+
             # 2. 计算下单数量
             available_capital = self._get_available_capital(
                 strategy_id,
@@ -2433,24 +2570,35 @@ class TradingExecutor:
             
             amount = 0.0
 
+            bot_type = (trading_config or {}).get('bot_type', '')
+            is_bot_script = bool(bot_type)
+
             # Frontend position sizing alignment:
-            # - open_* uses entry_pct from trading_config if provided (0~1 or 0~100 are both accepted)
-            if sig in ("open_long", "open_short") and isinstance(trading_config, dict):
+            # - non-bot open_* uses entry_pct from trading_config if provided
+            # - bot scripts pass their own amount/ratio from ctx.buy()/ctx.sell()
+            if (not is_bot_script) and sig in ("open_long", "open_short") and isinstance(trading_config, dict):
                 ep = trading_config.get("entry_pct")
                 if ep is not None:
                     position_size = self._to_ratio(ep, default=position_size if position_size is not None else 0.0)
 
-            # Open / add sizing: position_size is treated as capital ratio in [0,1].
+            # Open / add sizing
             if ('open' in sig or 'add' in sig):
                  if position_size is None or float(position_size) <= 0:
                      position_size = 0.05
-                 position_ratio = self._to_ratio(position_size, default=0.05)
-                 if market_type == 'spot':
-                     amount = available_capital * position_ratio / current_price
+
+                 if is_bot_script and float(position_size) > 1.0:
+                     # Bot scripts pass amount as absolute USDT notional, not ratio.
+                     usdt_notional = float(position_size)
+                     if market_type == 'spot':
+                         amount = usdt_notional / current_price
+                     else:
+                         amount = (usdt_notional * leverage) / current_price
                  else:
-                     # Futures sizing: treat available_capital as margin budget.
-                     # Notional = margin * leverage, so base quantity = (margin * leverage) / price.
-                     amount = (available_capital * position_ratio * leverage) / current_price
+                     position_ratio = self._to_ratio(position_size, default=0.05)
+                     if market_type == 'spot':
+                         amount = available_capital * position_ratio / current_price
+                     else:
+                         amount = (available_capital * position_ratio * leverage) / current_price
 
             # Reduce sizing: position_size is treated as a reduce ratio (close X% of current position).
             if sig in ("reduce_long", "reduce_short"):
@@ -2476,13 +2624,25 @@ class TradingExecutor:
 
             # 4. Execute order enqueue (PendingOrderWorker will dispatch notifications in signal mode)
             if 'close' in sig:
-                # 平仓逻辑：找到对应持仓大小
-                pos = next((p for p in current_positions if p.get('side') and p['side'] in signal_type), None)
+                pos_side = 'long' if 'long' in sig else 'short'
+                pos = next((p for p in current_positions if (p.get('side') or '').strip().lower() == pos_side), None)
                 if not pos:
                     return False
-                amount = float(pos['size'] or 0.0)
-                if amount <= 0:
+                full_size = float(pos.get('size') or 0.0)
+                if full_size <= 0:
                     return False
+
+                if is_bot_script and position_size is not None and float(position_size) > 1.0 and current_price > 0:
+                    usdt_notional = float(position_size)
+                    close_qty = (usdt_notional * leverage) / current_price if market_type != 'spot' else usdt_notional / current_price
+                    if close_qty < full_size * 0.99:
+                        amount = close_qty
+                        sig = f"reduce_{pos_side}"
+                        signal_type = sig
+                    else:
+                        amount = full_size
+                else:
+                    amount = full_size
 
             if amount <= 0 and ('open' in signal_type or 'add' in signal_type):
                 return False
@@ -2500,6 +2660,10 @@ class TradingExecutor:
                 leverage=leverage,
                 execution_mode=execution_mode,
                 notification_config=notification_config,
+                stop_loss_price=stop_loss_price,
+                take_profit_price=take_profit_price,
+                signal_reason=signal_reason,
+                trailing_stop_price=trailing_stop_price,
                 signal_ts=int(signal_ts or 0),
                 order_mode=bot_order_mode,
             )
@@ -2834,6 +2998,8 @@ class TradingExecutor:
         margin_mode: str = 'cross',
         stop_loss_price: float = None,
         take_profit_price: float = None,
+        signal_reason: str = "",
+        trailing_stop_price: float = None,
         # Order execution params (order_mode, maker_wait_sec, maker_offset_bps) are now
         # configured via environment variables: ORDER_MODE, MAKER_WAIT_SEC, MAKER_OFFSET_BPS
         # These parameters are kept for backward compatibility but will be ignored.
@@ -2866,6 +3032,8 @@ class TradingExecutor:
                 "signal_ts": int(signal_ts or 0),
                 "stop_loss_price": float(stop_loss_price or 0.0) if stop_loss_price is not None else 0.0,
                 "take_profit_price": float(take_profit_price or 0.0) if take_profit_price is not None else 0.0,
+                "trailing_stop_price": float(trailing_stop_price or 0.0) if trailing_stop_price is not None else 0.0,
+                "reason": str(signal_reason or "").strip(),
                 "margin_mode": str(margin_mode or "cross"),
                 "maker_retries": int(maker_retries or 0),
                 "close_fallback_to_market": bool(close_fallback_to_market),
@@ -3074,6 +3242,30 @@ class TradingExecutor:
     def _place_stop_loss_order(self, *args, **kwargs):
         pass
 
+    @staticmethod
+    def _signal_reason_log_suffix(signal: Optional[Dict[str, Any]]) -> str:
+        info = signal if isinstance(signal, dict) else {}
+        reason = str(info.get("reason") or "").strip()
+        if not reason:
+            return ""
+
+        parts = [f"reason={reason}"]
+        for key, label in (
+            ("stop_loss_price", "sl"),
+            ("take_profit_price", "tp"),
+            ("trailing_stop_price", "trail"),
+        ):
+            value = info.get(key)
+            if value is None:
+                continue
+            try:
+                fv = float(value)
+            except Exception:
+                continue
+            if fv > 0:
+                parts.append(f"{label}={fv:.6f}")
+        return f", {', '.join(parts)}"
+
     def _get_available_capital(
         self,
         strategy_id: int,
@@ -3151,6 +3343,44 @@ class TradingExecutor:
 
         equity = float(initial_capital or 0.0) + realized_pnl + unrealized_pnl
         return max(0.0, equity)
+
+    def _current_position_value(
+        self,
+        current_positions: Optional[List[Dict[str, Any]]],
+        current_price: Optional[float],
+    ) -> float:
+        """Calculate total USDT notional of all open positions."""
+        total = 0.0
+        for pos in (current_positions or []):
+            try:
+                size = float(pos.get("size") or 0)
+                entry = float(pos.get("entry_price") or 0)
+                mark = float(current_price or entry or 0)
+                if size > 0 and mark > 0:
+                    total += size * mark
+            except Exception:
+                continue
+        return total
+
+    def _get_daily_pnl(self, strategy_id: int) -> float:
+        """Get today's realized PnL (profit minus fees) for the strategy."""
+        try:
+            with get_db_connection() as db:
+                cursor = db.cursor()
+                cursor.execute(
+                    """
+                    SELECT COALESCE(SUM(COALESCE(profit, 0) - COALESCE(commission, 0)), 0) AS daily_pnl
+                    FROM qd_strategy_trades
+                    WHERE strategy_id = %s AND DATE(created_at) = CURDATE()
+                    """,
+                    (strategy_id,),
+                )
+                row = cursor.fetchone() or {}
+                cursor.close()
+                return float(row.get("daily_pnl") or 0.0)
+        except Exception as e:
+            logger.warning(f"Failed to get daily pnl for strategy {strategy_id}: {e}")
+            return 0.0
 
     def _record_trade(self, strategy_id: int, symbol: str, type: str, price: float, amount: float, value: float, profit: float = None, commission: float = None):
         """记录交易到数据库"""
