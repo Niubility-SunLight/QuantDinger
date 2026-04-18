@@ -59,96 +59,206 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `run.py` 还会根据 `PROXY_URL` 自动设置标准代理环境变量，并对中国金融数据域名设置 `NO_PROXY` 直连。
 - Docker 部署默认要求非示例值的 `SECRET_KEY`；文档和入口脚本都把默认示例密钥视为不安全配置。
 
-## 高层架构
+## 系统架构（5 层流水线）
 
-### 部署结构
+```
+前端 (Vue SPA)  ──►  [层1] HTTP 路由层  ──►  [层2] 数据服务层
+                                                           │
+                                                       ▼    ▼
+[层5] 交易所直连 REST ◄── [层4] Pending Order Worker ◄── [层3] 策略执行器
+                                                           ▲
+                                                    [层3] 回测引擎
+```
 
-- `frontend/` 是一个 Nginx 镜像，只负责提供 `frontend/dist/` 静态文件，并把 `/api/` 反向代理到后端容器。
-- `backend_api_python/` 是 Flask 应用，既支持本地 `python run.py` 开发，也支持 Docker 中用 gunicorn 运行。
-- 数据库层目前只走 PostgreSQL；`app/utils/db.py` 已经是 PostgreSQL 专用门面。
-- Redis 在 Docker 形态中承担可选缓存 / 运行时支撑角色；另外部分代码路径也会在本地模式下使用轻量级内存缓存。
+### 层 1 — HTTP 路由层（薄路由，零业务逻辑）
+**目录**: `backend_api_python/app/routes/`
 
-### 后端启动模型
+接收前端请求，转发至对应 service 层。**每个 blueprint 是独立文件**，主要路由前缀：
 
-- `backend_api_python/app/__init__.py` 中的 `create_app()` 是真正的后端启动中心。
-- `create_app()` 不只是注册 Flask blueprint，还会：
-  - 安装自定义 JSON provider，把 `NaN` / `Infinity` 转成 `null`
-  - 初始化数据库连接
-  - 确保管理员账号存在
-  - 注册 `app/routes` 下全部 blueprint
-  - 启动多个后台 worker：pending order、portfolio monitor、USDT 订单检测、Polymarket、AI calibration、reflection
-  - 尝试在启动时恢复之前运行中的策略
-- 重点：**调用 `create_app()` 会产生副作用**。不要为了“读配置”或“单纯 import 模块”而随意触发它。
+| 前缀 | 文件 | 职责 |
+|------|------|------|
+| `/api/auth` | `auth.py` | JWT 登录/注册/OAuth |
+| `/api/users` | `user.py` | 用户管理 |
+| `/api/indicator` | `indicator.py`, `kline.py`, `backtest.py` | 指标编辑、K线、回测 |
+| `/api/market` | `market.py` | 实时行情 |
+| `/api/fast-analysis` | `fast_analysis.py` | AI 分析入口 |
+| `/api/portfolio` | `portfolio.py` | 持仓与账户 |
+| `/api/billing` | `billing.py` | 积分计费 |
+| `/api/quick-trade` | `quick_trade.py` | 快速下单 |
+| `/api/ibkr` | `ibkr.py` | IBKR 美股 |
+| `/api/mt5` | `mt5.py` | MT5 外汇 |
+| `/api/polymarket` | `polymarket.py` | Polymarket 预测市场 |
+| `/api/experiment` | `experiment.py` | 策略进化/实验 |
+| `/api/dashboard`, `/api/global-market`, `/api/community`, `/api/settings`, `/api/credentials` | 对应文件 | Dashboard / 全局市场 / 社区 / 设置 / 凭证 |
 
-### 路由与服务分层
+### 层 2 — 数据服务层（数据聚合与缓存）
+**上游**: 层 1 调用
+**下游**: 层 3（策略、回测）依赖此层数据
 
-- HTTP 接口位于 `backend_api_python/app/routes/`，大多作为薄路由层。
-- 主要业务逻辑集中在 `backend_api_python/app/services/`。
-- 主要 API 面按前缀划分，包括：
-  - `/api/auth`
-  - `/api/users`
-  - `/api/indicator`
-  - `/api/market`
-  - `/api/fast-analysis`
-  - `/api/portfolio`
-  - `/api/billing`
-  - `/api/quick-trade`
-  - `/api/experiment`
-  - `/api/ibkr`
-  - `/api/mt5`
-  - `/api/polymarket`
+此层分为两个子模块：
 
-### 市场数据层
+**2a. K 线数据服务** (`app/services/kline.py` + `app/data_sources/factory.py`)
+- `KlineService`: 封装 `DataSourceFactory`，TTL 缓存最新数据（历史数据不缓存）
+- `DataSourceFactory.get_source(market)`: 按市场类型返回适配器实例
+- `DataSourceFactory.get_data_source(name)`: 兼容旧代码，别名路由到 Crypto
 
-- `app/data_sources/` 是底层市场/供应商适配层，负责不同市场和数据源的原始访问。
-- `app/data_sources/factory.py` 通过市场类型选择数据源，是行情和 K 线获取的统一入口；当前支持 `Crypto`、`CNStock`、`HKStock`、`USStock`、`Forex`、`Futures`。
-- `app/data_providers/` 位于更上层，服务于 dashboard / global market 这类聚合场景，例如热力图、新闻、情绪、机会扫描等。
+**2b. 聚合数据提供器** (`app/data_providers/`)
+- 上层封装，服务 Dashboard / 全局市场：热力图、新闻、情绪、机会扫描
+- `crypto.py`, `forex.py`, `indices.py`, `commodities.py`, `heatmap.py`, `news.py`, `sentiment.py`, `opportunities.py`
+- 通过 Redis 或内存 `CacheManager` 缓存，默认 TTL 60s–6h 不等
 
-### 策略、回测与执行链路
+**底层数据源适配器** (`app/data_sources/`)
 
-- 仓库文档中约定了两种主要策略模型：
-  - `IndicatorStrategy`：DataFrame 风格脚本，输出 `buy` / `sell` 信号
-  - `ScriptStrategy`：事件驱动脚本，带显式生命周期回调和下单控制
-- `app/services/backtest.py` 是主回测引擎。该文件体量很大，负责回测执行、结果持久化，以及按回测区间自动切换更高精度执行周期（`1m` / `5m`）。
-- `app/services/trading_executor.py` 负责实时策略线程，拉取市场数据、计算信号，并把待执行订单写入数据库。
-- 实际交易执行与信号生成是分离的：
-  - `trading_executor.py` 负责生成 pending orders
-  - `app/services/pending_order_worker.py` 负责真正派发订单
-  - 各交易所执行适配器位于 `app/services/live_trading/`
-- 启动恢复逻辑当前只恢复 `IndicatorStrategy`；其它策略类型在恢复阶段会被跳过。
+| 文件 | 底层依赖 | 支持市场 |
+|------|----------|----------|
+| `crypto.py` | CCXT | Crypto（Binance, OKX, Bybit 等） |
+| `us_stock.py` | yfinance | 美股 |
+| `cn_stock.py` | 腾讯财经 | A 股 |
+| `hk_stock.py` | 腾讯财经 | 港股 |
+| `forex.py` | yfinance | 外汇 |
+| `futures.py` | CCXT | 期货/大宗商品 |
+| `polymarket.py` | Polymarket API | 预测市场 |
+| `base.py` | — | 抽象基类，定义 `get_kline` / `get_ticker` 接口 |
 
-### AI 分析链路
+关键基础设施：
+- `cache_manager.py`: Redis / 内存 LRU 缓存门面
+- `rate_limiter.py`: 限流器
+- `circuit_breaker.py`: 熔断器
+- `tencent.py`: 腾讯财经 HTTP 适配
 
-- `app/services/fast_analysis.py` 是 `/api/fast-analysis/*` 背后的主 AI 分析服务。
-- 其结构是明确分层的：
-  - 市场数据采集：`market_data_collector`
-  - 单次 LLM 分析：`LLMService`
-  - 历史记忆检索与写入：`analysis_memory`
-  - 阈值调优：`ai_calibration`
-- Polymarket 相关上下文也被整合进这条分析链路中。
+### 层 3 — 策略层（信号生成）
 
-### 兼容旧系统的配置层
+此层分为**回测**和**实时执行**两条路径：
 
-- `app/utils/config_loader.py` 会把环境变量映射成旧 PHP addon 风格的嵌套配置结构。
-- 很多服务读取的并不是直接的 `os.environ`，而是这层兼容配置，尤其是 LLM、搜索、数据源相关配置。
-- 如果某个行为看起来像是“来自 addon 配置”，优先检查 `config_loader.py`，不要假设项目里还存在数据库驱动或文件驱动的旧配置中心。
+**3a. 回测引擎** (`app/services/backtest.py`)
+- `BacktestService`: 主类
+- 从 `DataSourceFactory` 拉取 K 线（含 TTL 缓存）
+- 自动多时间周期切换：`1m` 回测 ≤15 天自动提升精度；`5m` 回测 ≤1 年
+- 指标计算：`IndicatorParamsParser` + `builtin_indicators.py`
+- 策略编译：`strategy_compiler.py`（将结构化配置 JSON 编译为可执行 Python 代码）
+- 结果写入 `qd_backtest_runs` 表
+
+**3b. 实时策略执行器** (`app/services/trading_executor.py`)
+- `TradingExecutor`: 核心类，按策略 ID 启动独立线程
+- `StrategyService`: 策略 CRUD、状态管理
+- 策略循环：拉 K 线 → 解析指标参数 → 执行策略代码 → 去重信号 → 写入 `pending_orders` 表
+- 支持两种策略模式：
+  - `IndicatorStrategy`（DataFrame 脚本，输出 `buy`/`sell`）
+  - `ScriptStrategy`（事件驱动脚本，显式生命周期回调）
+- 本地价格缓存（TTL 10s）和信号去重缓存防止重复下单
+- 启动恢复：只恢复 `IndicatorStrategy`，其他类型跳过
+
+**3c. 策略辅助** (`app/services/`)
+- `indicator_params.py`: 解析 `@param` 注解、支持 `call_indicator()` 嵌套调用
+- `builtin_indicators.py`: 内置示例指标（RSI 等）
+- `strategy_script_runtime.py`: ScriptStrategy 事件驱动运行时
+- `strategy_snapshot.py`: 策略快照备份
+- `experiment/`: 策略参数空间进化（`evolution.py`）、评分（`scoring.py`）、市场 Regime 检测（`regime.py`）
+
+### 层 4 — 风控与信号通知层
+
+**4a. 风控信号通知** (`app/services/signal_notifier.py`)
+- `SignalNotifier`: 支持多渠道推送（浏览器通知、Email、Telegram、Discord、Webhook）
+- 基于策略的 `notification_config` JSON 配置
+
+**4b. 持仓监控** (`app/services/portfolio_monitor.py`)
+- 后台线程轮询用户手动持仓
+- AI 驱动价格/盈亏预警通知
+- 依赖 `fast_analysis.py` 进行 AI 量化分析
+
+### 层 5 — 实盘执行层（订单派发与交易所对接）
+
+```
+层3 signals → pending_orders DB表 ← PendingOrderWorker(轮询)
+                                         │
+                                    execution_mode:
+                                    - signal: 只发通知
+                                    - live: 直连交易所 REST
+                                         │
+                          app/services/live_trading/
+                          ├── factory.py          工厂：根据 exchange_id 创建客户端
+                          ├── execution.py        信号→订单转换、符号规范化
+                          ├── records.py          成交回报写入本地持仓表
+                          └── [各交易所适配器]
+                              ├── binance.py / binance_spot.py
+                              ├── okx.py / bitget.py / bybit.py / gate.py
+                              ├── kucoin.py / kraken.py / coinbase_exchange.py
+                              ├── deepcoin.py / htx.py
+                              ├── ibkr_trading/client.py   (美股，ib_insync)
+                              └── mt5_trading/client.py     (外汇，MetaTrader5 SDK)
+```
+
+**PendingOrderWorker** (`app/services/pending_order_worker.py`):
+- 独立后台线程，每秒轮询 `pending_orders` 表（批量 50 条）
+- 状态机：`pending` → `processing` → `filled`/`failed`
+- 防重：90s STALE 超时自动释放被废弃的 processing 订单
+- 持仓同步：定期对比本地 `qd_strategy_positions` 与交易所实际持仓，消除”幽灵持仓”
+
+**各交易所适配器**（均继承 `BaseRestClient`，纯 `requests` 无 CCXT）：
+- `BaseRestClient`: 统一 HTTP 封装，处理 SSL 验证、代理、超时、错误解析
+- 每个交易所独立文件，完整实现：下单/市价/止损单、持仓查询、余额查询、费用查询
+
+---
+
+### 各层依赖关系
+
+```
+层1(路由) → 层2(数据)    ← 层3(回测路径)
+         ↘
+          层3(实时路径) → 层4(风控通知)
+                            ↓
+                       层5(实盘执行)
+```
+
+关键原则：
+- **层 3 实时路径依赖层 2**：策略线程通过 `KlineService` 获取数据
+- **层 3 回测路径独立依赖层 2**：回测引擎直接用 `DataSourceFactory`
+- **层 5 只被层 4 触发**：不主动拉取信号，只响应 `pending_orders` 表中的信号
+
+---
+
+### 启动时的后台线程（`create_app()` 启动钩子）
+
+| 线程 | 环境变量 | 依赖层 |
+|------|----------|--------|
+| `PendingOrderWorker` | `ENABLE_PENDING_ORDER_WORKER` | 层 5 |
+| `PortfolioMonitor` | `ENABLE_PORTFOLIO_MONITOR` | 层 4 |
+| `USDTOrderWorker` | `USDT_PAY_ENABLED` | 支付层 |
+| `PolymarketWorker` | — | 层 2 数据 |
+| `AI Calibration` | — | 层 3 策略 |
+| `Reflection Worker` | — | 层 3 策略 |
+| `restore_running_strategies` | `DISABLE_RESTORE_RUNNING_STRATEGIES` | 层 3 |
+
+### AI 分析链路（与策略层并行）
+
+`app/services/fast_analysis.py` — `/api/fast-analysis/*` 的主服务：
+
+```
+MarketDataCollector → LLMService → analysis_memory → ai_calibration → 响应
+     (数据采集)       (单次LLM调用)  (历史记忆)     (阈值自调优)
+```
+
+- `market_data_collector.py`: 统一封装 K 线（`DataSourceFactory`）、宏观数据（VIX/DXY/TNX 等）、Finnhub 新闻/基本面
+- `llm.py`: 多后端统一接口（OpenRouter / OpenAI / Gemini / DeepSeek / Grok）
+- `analysis_memory.py`: 检索与写入历史分析记忆
+- `ai_calibration.py`: 根据历史命中率自动调优阈值
+- `reflection.py`: 定期回溯验证 AI 决策质量
+
+---
 
 ## 阅读与定位建议
 
-- 多个核心文件体量很大，例如：
-  - `app/services/backtest.py`
-  - `app/services/trading_executor.py`
-  - `app/services/fast_analysis.py`
-  - `app/services/strategy.py`
-  - `app/routes/quick_trade.py`
-  - `app/routes/strategy.py`
-- 处理这些文件时，优先用符号搜索 / 关键字搜索，不要从头到尾通读。
-- 想快速理解启动和运行时行为，优先看：
-  - `DEVELOPMENT.md`
-  - `backend_api_python/README.md`
-  - `backend_api_python/app/__init__.py`
-  - `backend_api_python/app/routes/__init__.py`
-  - `backend_api_python/app/utils/config_loader.py`
+- **大文件定位**：核心文件体量大，优先用 Grep 搜索关键字而非通读：
+  - 回测引擎：`app/services/backtest.py`
+  - 实时策略执行：`app/services/trading_executor.py`
+  - AI 分析服务：`app/services/fast_analysis.py`
+  - 策略管理：`app/services/strategy.py`
+  - 订单派发：`app/services/pending_order_worker.py`
+  - 交易所适配器：`app/services/live_trading/` 目录
+  - 快速下单路由：`app/routes/quick_trade.py`
+  - 指标路由：`app/routes/strategy.py`
+- **配置问题排查**：优先查 `config_loader.py`，它将环境变量映射为兼容旧 addon 的嵌套配置
+- **数据库表结构**：`migrations/init.sql` 包含完整的 PostgreSQL schema，是所有 ORM/DB 操作的源头
 
 ## Skills
 
