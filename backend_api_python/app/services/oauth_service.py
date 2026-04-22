@@ -4,8 +4,8 @@ OAuth Service - Handles Google and GitHub OAuth authentication.
 import os
 import secrets
 import requests
-from urllib.parse import urlencode
-from datetime import datetime
+from urllib.parse import urlencode, urlparse
+from datetime import datetime, timezone, timedelta
 from typing import Tuple, Optional, Dict, Any
 from app.utils.db import get_db_connection
 from app.utils.logger import get_logger
@@ -26,9 +26,121 @@ def get_oauth_service():
 
 class OAuthService:
     """OAuth service for Google and GitHub authentication"""
-    
+
+    # Class-level cache: only create OAuth state table once per process
+    _state_schema_ensured: bool = False
+
     def __init__(self):
         self._load_config()
+
+    def _oauth_state_ttl_minutes(self) -> int:
+        try:
+            return max(5, min(120, int(float(os.getenv("OAUTH_STATE_TTL_MINUTES", "20") or 20))))
+        except Exception:
+            return 20
+
+    def _ensure_oauth_state_schema(self, cur) -> None:
+        """Create qd_oauth_states table if missing.
+
+        OAuth state MUST be shared across Gunicorn workers / replicas; an
+        in-memory dict breaks multi-worker deployments (authorize hits worker
+        A, callback lands on worker B → Invalid state).
+        """
+        if OAuthService._state_schema_ensured:
+            return
+        try:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS qd_oauth_states (
+                    state VARCHAR(128) PRIMARY KEY,
+                    provider VARCHAR(20) NOT NULL,
+                    redirect TEXT,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    expires_at TIMESTAMP NOT NULL
+                )
+                """
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_oauth_states_expires ON qd_oauth_states(expires_at)"
+            )
+            OAuthService._state_schema_ensured = True
+        except Exception as e:
+            logger.debug(f"_ensure_oauth_state_schema: {e}")
+
+    def _oauth_state_save(self, state: str, provider: str, redirect: Optional[str]) -> None:
+        # Store naive UTC for TIMESTAMP WITHOUT TIME ZONE columns.
+        exp = (
+            datetime.now(timezone.utc) + timedelta(minutes=self._oauth_state_ttl_minutes())
+        ).replace(tzinfo=None)
+        red = (redirect or "").strip() if redirect else ""
+        with get_db_connection() as db:
+            cur = db.cursor()
+            self._ensure_oauth_state_schema(cur)
+            try:
+                cur.execute("DELETE FROM qd_oauth_states WHERE expires_at < NOW()")
+            except Exception:
+                pass
+            # IMPORTANT: include RETURNING state explicitly.  Otherwise the
+            # PostgresCursor wrapper would auto-append RETURNING id, and this
+            # table has no "id" column → INSERT fails with UndefinedColumn.
+            cur.execute(
+                """
+                INSERT INTO qd_oauth_states (state, provider, redirect, expires_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT (state) DO UPDATE
+                  SET provider = EXCLUDED.provider,
+                      redirect = EXCLUDED.redirect,
+                      expires_at = EXCLUDED.expires_at
+                RETURNING state
+                """,
+                (state, provider, red, exp),
+            )
+            try:
+                cur.fetchone()
+            except Exception:
+                pass
+            db.commit()
+            cur.close()
+
+    def _oauth_state_peek_redirect(self, state: str) -> str:
+        if not state:
+            return ""
+        try:
+            with get_db_connection() as db:
+                cur = db.cursor()
+                self._ensure_oauth_state_schema(cur)
+                cur.execute(
+                    "SELECT redirect FROM qd_oauth_states WHERE state = ? AND expires_at > NOW()",
+                    (state,),
+                )
+                row = cur.fetchone()
+                cur.close()
+                if not row:
+                    return ""
+                return (row.get("redirect") or "").strip()
+        except Exception as e:
+            logger.warning(f"OAuth state peek failed: {e}")
+            return ""
+
+    def _oauth_state_consume(self, state: str, provider: str) -> bool:
+        """Delete and validate state in one statement; True iff a row was removed."""
+        if not state:
+            return False
+        try:
+            with get_db_connection() as db:
+                cur = db.cursor()
+                self._ensure_oauth_state_schema(cur)
+                cur.execute(
+                    "DELETE FROM qd_oauth_states WHERE state = ? AND provider = ? AND expires_at > NOW()",
+                    (state, provider),
+                )
+                n = int(getattr(cur, "rowcount", 0) or 0)
+                db.commit()
+                cur.close()
+                return n > 0
+        except Exception as e:
+            logger.error(f"OAuth state consume failed: {e}", exc_info=True)
+            return False
     
     def _load_config(self):
         """Load OAuth configuration from environment variables"""
@@ -46,27 +158,69 @@ class OAuthService:
         
         # Frontend URL for redirect after OAuth
         self.frontend_url = os.getenv('FRONTEND_URL', 'http://localhost:8080')
-        
-        # State storage (in-memory for simplicity, could use Redis in production)
-        self._states = {}
-    
+
+        # Allow-listed origins that may be used as post-login redirect targets
+        # (comma-separated). FRONTEND_URL is always allowed.
+        raw_allowed = os.getenv('OAUTH_ALLOWED_REDIRECTS', '')
+        extra = [x.strip() for x in raw_allowed.split(',') if x.strip()]
+        self.allowed_redirect_origins = set()
+        for item in [self.frontend_url] + extra:
+            origin = self._normalize_origin(item)
+            if origin:
+                self.allowed_redirect_origins.add(origin)
+
+    @staticmethod
+    def _normalize_origin(url: str) -> str:
+        """Return scheme://host[:port] for a URL, empty string if invalid."""
+        if not url:
+            return ''
+        try:
+            parsed = urlparse(url if '://' in url else f'https://{url}')
+            if not parsed.scheme or not parsed.netloc:
+                return ''
+            return f"{parsed.scheme}://{parsed.netloc}".lower().rstrip('/')
+        except Exception:
+            return ''
+
+    def is_redirect_allowed(self, redirect_url: str) -> bool:
+        """Check whether the given URL origin is on the allow-list."""
+        origin = self._normalize_origin(redirect_url)
+        if not origin:
+            return False
+        return origin in self.allowed_redirect_origins
+
+    def peek_state_redirect(self, state: str) -> str:
+        """Read the redirect URL associated with a pending OAuth state (no deletion)."""
+        return self._oauth_state_peek_redirect(state)
+
     # =========================================================================
     # Google OAuth
     # =========================================================================
-    
-    def get_google_auth_url(self, state: str = None) -> Tuple[str, str]:
+
+    def get_google_auth_url(self, state: str = None, redirect_url: str = None) -> Tuple[str, str]:
         """
         Generate Google OAuth authorization URL.
-        
+
+        Args:
+            state: Optional preset state token.
+            redirect_url: Optional front-end URL to redirect back to after login.
+                          Must be in the allow-list, otherwise ignored.
         Returns:
             (auth_url, state)
         """
         if not self.google_enabled:
             return '', ''
-        
+
         state = state or secrets.token_urlsafe(32)
-        self._states[state] = {'provider': 'google', 'created_at': datetime.now()}
-        
+        red = ""
+        if redirect_url and self.is_redirect_allowed(redirect_url):
+            red = redirect_url.strip()
+        try:
+            self._oauth_state_save(state, "google", red or None)
+        except Exception as e:
+            logger.error(f"Failed to persist Google OAuth state: {e}")
+            return '', ''
+
         params = {
             'client_id': self.google_client_id,
             'redirect_uri': self.google_redirect_uri,
@@ -91,12 +245,9 @@ class OAuthService:
         Returns:
             (success, user_info_or_error)
         """
-        # Validate state
-        if state not in self._states or self._states[state].get('provider') != 'google':
+        if not self._oauth_state_consume(state, "google"):
             return False, {'error': 'Invalid state parameter'}
-        
-        del self._states[state]
-        
+
         try:
             # Exchange code for tokens
             token_response = requests.post(
@@ -149,19 +300,26 @@ class OAuthService:
     # GitHub OAuth
     # =========================================================================
     
-    def get_github_auth_url(self, state: str = None) -> Tuple[str, str]:
+    def get_github_auth_url(self, state: str = None, redirect_url: str = None) -> Tuple[str, str]:
         """
         Generate GitHub OAuth authorization URL.
-        
+
         Returns:
             (auth_url, state)
         """
         if not self.github_enabled:
             return '', ''
-        
+
         state = state or secrets.token_urlsafe(32)
-        self._states[state] = {'provider': 'github', 'created_at': datetime.now()}
-        
+        red = ""
+        if redirect_url and self.is_redirect_allowed(redirect_url):
+            red = redirect_url.strip()
+        try:
+            self._oauth_state_save(state, "github", red or None)
+        except Exception as e:
+            logger.error(f"Failed to persist GitHub OAuth state: {e}")
+            return '', ''
+
         params = {
             'client_id': self.github_client_id,
             'redirect_uri': self.github_redirect_uri,
@@ -183,12 +341,9 @@ class OAuthService:
         Returns:
             (success, user_info_or_error)
         """
-        # Validate state
-        if state not in self._states or self._states[state].get('provider') != 'github':
+        if not self._oauth_state_consume(state, "github"):
             return False, {'error': 'Invalid state parameter'}
-        
-        del self._states[state]
-        
+
         try:
             # Exchange code for token
             token_response = requests.post(
@@ -544,12 +699,16 @@ class OAuthService:
     # =========================================================================
     
     def cleanup_expired_states(self, max_age_minutes: int = 10):
-        """Clean up expired OAuth states"""
-        cutoff = datetime.now()
-        from datetime import timedelta
-        cutoff = cutoff - timedelta(minutes=max_age_minutes)
-        
-        expired = [k for k, v in self._states.items() 
-                   if v.get('created_at', datetime.now()) < cutoff]
-        for k in expired:
-            del self._states[k]
+        """Delete expired OAuth state rows from the DB.
+        `max_age_minutes` is kept for backward-compat but is ignored — expiry
+        is driven by qd_oauth_states.expires_at which is set on insert.
+        """
+        try:
+            with get_db_connection() as db:
+                cur = db.cursor()
+                self._ensure_oauth_state_schema(cur)
+                cur.execute("DELETE FROM qd_oauth_states WHERE expires_at < NOW()")
+                db.commit()
+                cur.close()
+        except Exception as e:
+            logger.debug(f"cleanup_expired_states: {e}")

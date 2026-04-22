@@ -770,7 +770,7 @@ CONFIG_SCHEMA = {
                 'key': 'USDT_TRC20_CONTRACT',
                 'label': 'USDT TRC20 Contract',
                 'type': 'text',
-                'default': 'TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj',
+                'default': 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t',
                 'description': 'USDT contract address on TRON'
             },
             {
